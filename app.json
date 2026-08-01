@@ -2,13 +2,15 @@
   "expo": {
     "name": "卡匣",
     "slug": "card-cabinet",
-    "version": "1.0.2",
+    "version": "1.1.0",
+    "icon": "./assets/card-case-logo.png",
     "orientation": "portrait",
     "userInterfaceStyle": "light",
     "android": {
       "package": "com.cardcabinet.app",
       "adaptiveIcon": {
-        "backgroundColor": "#F5F5F0"
+        "foregroundImage": "./assets/card-case-logo.png",
+        "backgroundColor": "#F7F3EA"
       },
       "blockedPermissions": [
         "android.permission.RECORD_AUDIO",
