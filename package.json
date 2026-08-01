@@ -1,0 +1,33 @@
+{
+  "name": "card-cabinet",
+  "version": "1.0.0",
+  "main": "node_modules/expo/AppEntry.js",
+  "scripts": {
+    "start": "expo start",
+    "android": "expo run:android",
+    "apk": "powershell -ExecutionPolicy Bypass -File .\\scripts\\build-android.ps1",
+    "lint": "eslint . --ext .js,.jsx",
+    "check": "node --check App.js",
+    "ios": "expo run:ios"
+  },
+  "dependencies": {
+    "@expo/vector-icons": "~14.0.4",
+    "@react-native-async-storage/async-storage": "1.23.1",
+    "expo": "~52.0.0",
+    "expo-asset": "~11.0.5",
+    "expo-file-system": "~18.0.12",
+    "expo-font": "~13.0.4",
+    "expo-image-picker": "~16.0.3",
+    "expo-linking": "~7.0.5",
+    "expo-status-bar": "~2.0.0",
+    "expo-system-ui": "~4.0.9",
+    "react": "18.3.1",
+    "react-native": "0.76.9"
+  },
+  "devDependencies": {
+    "eslint": "^8.57.1",
+    "eslint-config-expo": "~8.0.1",
+    "eslint-plugin-react-hooks": "^7.1.1"
+  },
+  "private": true
+}

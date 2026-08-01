@@ -1,0 +1,9 @@
+node_modules/
+.expo/
+dist/
+*.jks
+*.keystore
+emulator-*.png
+emulator-*.xml
+current-*.png
+update-*.png
