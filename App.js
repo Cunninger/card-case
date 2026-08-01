@@ -1,5 +1,6 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Clipboard from 'expo-clipboard';
+import * as LocalAuthentication from 'expo-local-authentication';
 import { useFonts } from 'expo-font';
 import * as FileSystem from 'expo-file-system';
 import * as Haptics from 'expo-haptics';
@@ -9,9 +10,10 @@ import { StatusBar } from 'expo-status-bar';
 import { Ionicons } from '@expo/vector-icons';
 import { Gesture, GestureDetector, GestureHandlerRootView } from 'react-native-gesture-handler';
 import Animated, { Extrapolation, interpolate, runOnJS, useAnimatedStyle, useSharedValue, withSpring } from 'react-native-reanimated';
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
+  AppState,
   FlatList,
   Image,
   Modal,
@@ -26,7 +28,8 @@ import {
 } from 'react-native';
 
 const STORAGE_KEY = '@card-cabinet/cards-v1';
-const APP_VERSION = '1.1.1';
+const LOCK_ENABLED_KEY = '@card-cabinet/privacy-lock-v1';
+const APP_VERSION = '1.2.0';
 const RELEASES_API = 'https://api.github.com/repos/Cunninger/card-case/releases/latest';
 const RELEASE_ASSET_MIRROR = 'https://gh-proxy.com/';
 const BRAND_LOGO = require('./assets/card-case-logo.png');
@@ -82,6 +85,10 @@ function BrandMark({ size = 44, style }) {
 
 function BrandSignature({ compact = false, inverse = false }) {
   return <View style={styles.brandSignature}><BrandMark size={compact ? 34 : 42} /><View><Text style={[styles.brandKicker, inverse && styles.brandKickerInverse]}>CARD CASE · PRIVATE ARCHIVE</Text><Text style={[styles.brandName, compact && styles.brandNameCompact, inverse && styles.brandNameInverse]}>卡匣</Text></View></View>;
+}
+
+function AppLock({ onUnlock, unlocking }) {
+  return <SafeAreaView style={styles.lockScreen}><StatusBar style="light" backgroundColor={BRAND.inkDeep} /><View style={styles.lockContent}><BrandSignature inverse /><View style={styles.lockEmblem}><Ionicons name="lock-closed" size={36} color={BRAND.goldSoft} /></View><Text style={styles.lockTitle}>你的卡匣已上锁</Text><Text style={styles.lockBody}>请使用设备验证身份后继续。</Text><Pressable accessibilityRole="button" accessibilityLabel="验证身份并解锁卡匣" disabled={unlocking} onPress={onUnlock} style={({ pressed }) => [styles.unlockButton, unlocking && styles.unlockButtonDisabled, pressed && styles.unlockButtonPressed]}><Ionicons name={unlocking ? 'sync' : 'scan-outline'} size={20} color={BRAND.inkDeep} /><Text style={styles.unlockButtonText}>{unlocking ? '正在验证…' : '验证身份并解锁'}</Text></Pressable><Text style={styles.lockHint}>验证信息仅由此设备的系统处理。</Text></View></SafeAreaView>;
 }
 
 function CardVisual({ card, compact = false, style }) {
@@ -182,14 +189,54 @@ export default function App() {
   const [editorOpen, setEditorOpen] = useState(false);
   const [draft, setDraft] = useState(emptyDraft());
   const [update, setUpdate] = useState({ status: 'idle', message: `当前版本 ${APP_VERSION}` });
+  const [appLockEnabled, setAppLockEnabled] = useState(false);
+  const [locked, setLocked] = useState(false);
+  const [unlocking, setUnlocking] = useState(false);
+  const [appIsActive, setAppIsActive] = useState(AppState.currentState === 'active');
+  const authInFlight = useRef(false);
+  const appState = useRef(AppState.currentState);
 
   useEffect(() => {
-    AsyncStorage.getItem(STORAGE_KEY).then((raw) => {
+    Promise.all([AsyncStorage.getItem(STORAGE_KEY), AsyncStorage.getItem(LOCK_ENABLED_KEY)]).then(([raw, lockPreference]) => {
       if (raw) setCards(JSON.parse(raw).map((card) => ({ ...card, frontImage: card.frontImage || card.image || null, backImage: card.backImage || null }))); else setCards(SEED_CARDS);
+      const shouldLock = lockPreference === 'true';
+      setAppLockEnabled(shouldLock);
+      setLocked(shouldLock);
     }).catch(() => setCards(SEED_CARDS)).finally(() => setReady(true));
   }, []);
 
   useEffect(() => { if (ready) AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(cards)); }, [cards, ready]);
+
+  const unlock = useCallback(async () => {
+    if (!appLockEnabled || authInFlight.current) return;
+    authInFlight.current = true;
+    setUnlocking(true);
+    try {
+      const [hasHardware, enrolled] = await Promise.all([LocalAuthentication.hasHardwareAsync(), LocalAuthentication.isEnrolledAsync()]);
+      if (!hasHardware || !enrolled) {
+        Alert.alert('无法使用应用锁', '此设备尚未设置指纹或人脸。请先在系统设置中添加生物识别信息，然后返回此处重试。');
+        return;
+      }
+      const result = await LocalAuthentication.authenticateAsync({ promptMessage: '验证身份以解锁卡匣', cancelLabel: '暂不解锁', fallbackLabel: '使用设备密码', disableDeviceFallback: false });
+      if (result.success) { setLocked(false); haptic('success'); }
+    } finally {
+      authInFlight.current = false;
+      setUnlocking(false);
+    }
+  }, [appLockEnabled]);
+
+  useEffect(() => { if (ready && appIsActive && appLockEnabled && locked) unlock(); }, [appIsActive, appLockEnabled, locked, ready, unlock]);
+
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', (nextState) => {
+      const returnedToForeground = appState.current !== 'active' && nextState === 'active';
+      appState.current = nextState;
+      setAppIsActive(nextState === 'active');
+      if (nextState !== 'active' && appLockEnabled) setLocked(true);
+      if (returnedToForeground && appLockEnabled) setLocked(true);
+    });
+    return () => subscription.remove();
+  }, [appLockEnabled]);
 
   const visibleCards = useMemo(() => cards.filter((card) => {
     const needle = query.trim().toLowerCase();
@@ -198,6 +245,25 @@ export default function App() {
   }), [cards, query, filter]);
   const favorites = cards.filter((card) => card.favorite);
   const expiring = cards.filter((card) => card.expiry && /^2026-(0[89]|1[0-2])$/.test(card.expiry)).length;
+
+  const toggleAppLock = async () => {
+    if (appLockEnabled) {
+      await AsyncStorage.setItem(LOCK_ENABLED_KEY, 'false');
+      setAppLockEnabled(false);
+      setLocked(false);
+      haptic();
+      return;
+    }
+    const [hasHardware, enrolled] = await Promise.all([LocalAuthentication.hasHardwareAsync(), LocalAuthentication.isEnrolledAsync()]);
+    if (!hasHardware || !enrolled) {
+      Alert.alert('暂时无法启用', '请先在系统设置中添加指纹或人脸信息，再开启应用锁。');
+      return;
+    }
+    await AsyncStorage.setItem(LOCK_ENABLED_KEY, 'true');
+    setAppLockEnabled(true);
+    setLocked(true);
+    haptic('success');
+  };
 
   const beginCreate = () => { haptic('impact'); setDraft(emptyDraft()); setEditorOpen(true); };
   const beginEdit = (card) => { setDraft({ ...card }); setSelected(null); setEditorOpen(true); };
@@ -258,11 +324,12 @@ export default function App() {
   const openUpdate = () => { if (update.downloadUrl) Linking.openURL(update.downloadUrl); };
 
   if (!ready || !iconsReady) return <SafeAreaView style={styles.loading}><Text style={styles.loadingText}>正在打开你的卡匣…</Text></SafeAreaView>;
+  if (locked) return <AppLock onUnlock={unlock} unlocking={unlocking} />;
 
   return <SafeAreaView style={styles.safe}><StatusBar style="dark" backgroundColor="#F6F6F1" />
     {tab === 'home' ? <Home cards={cards} favorites={favorites} expiring={expiring} onCreate={beginCreate} onSelect={setSelected} onOpenShowcase={() => setShowcaseOpen(true)} onShowAll={() => setTab('cards')} /> : null}
     {tab === 'cards' ? <Collection cards={visibleCards} query={query} setQuery={setQuery} filter={filter} setFilter={setFilter} onCreate={beginCreate} onSelect={setSelected} /> : null}
-    {tab === 'settings' ? <Settings cards={cards} update={update} onCheckUpdate={checkForUpdate} onOpenUpdate={openUpdate} onReset={() => Alert.alert('恢复示例数据？', '这会用示例卡片覆盖当前所有数据。', [{ text: '取消', style: 'cancel' }, { text: '恢复', style: 'destructive', onPress: () => setCards(SEED_CARDS) }])} /> : null}
+    {tab === 'settings' ? <Settings cards={cards} update={update} lockEnabled={appLockEnabled} onToggleLock={toggleAppLock} onCheckUpdate={checkForUpdate} onOpenUpdate={openUpdate} onReset={() => Alert.alert('恢复示例数据？', '这会用示例卡片覆盖当前所有数据。', [{ text: '取消', style: 'cancel' }, { text: '恢复', style: 'destructive', onPress: () => setCards(SEED_CARDS) }])} /> : null}
     <BottomNav active={tab} onChange={setTab} />
     <FanDeck key={showcaseOpen ? 'open' : 'closed'} open={showcaseOpen} cards={cards} onClose={() => setShowcaseOpen(false)} onSelect={(card) => { setShowcaseOpen(false); setSelected(card); }} />
     <CardDetail card={selected} onClose={() => setSelected(null)} onEdit={beginEdit} onFavorite={toggleFavorite} onDelete={deleteCard} />
@@ -354,11 +421,11 @@ function Editor({ open, draft, setDraft, onClose, onSave, onPickImage }) {
 }
 function Field({ label, value, onChangeText, placeholder, multiline, maxLength }) { return <View style={styles.field}><Text style={styles.fieldLabel}>{label}</Text><TextInput value={value} onChangeText={onChangeText} placeholder={placeholder} placeholderTextColor="#9A9D95" style={[styles.input, multiline && styles.inputMulti]} multiline={multiline} maxLength={maxLength} textAlignVertical={multiline ? 'top' : 'center'} /></View>; }
 
-function Settings({ cards, update, onCheckUpdate, onOpenUpdate, onReset }) {
+function Settings({ cards, update, lockEnabled, onToggleLock, onCheckUpdate, onOpenUpdate, onReset }) {
   const updateAvailable = update.status === 'available';
   return <ScrollView style={styles.screen} contentContainerStyle={styles.settingsContent} showsVerticalScrollIndicator={false}>
     <BrandSignature /><Text style={styles.pageTitle}>设置</Text><Text style={styles.pageSubtitle}>管理你的卡片资料与本地数据。</Text>
-    <View style={styles.settingsGroup}><Text style={styles.settingsLabel}>数据与隐私</Text><View style={styles.settingsCard}><View style={styles.settingRow}><View style={styles.settingIcon}><Ionicons name="phone-portrait-outline" size={20} color="#5A635B" /></View><View style={styles.settingBody}><Text style={styles.settingName}>本地存储</Text><Text style={styles.settingHint}>当前设备已保存 {cards.length} 张卡片</Text></View><Ionicons name="checkmark-circle" size={21} color="#4E896B" /></View><View style={styles.settingRow}><View style={styles.settingIcon}><Ionicons name="shield-checkmark-outline" size={20} color="#5A635B" /></View><View style={styles.settingBody}><Text style={styles.settingName}>隐私提醒</Text><Text style={styles.settingHint}>请不要保存密码、CVV 等认证信息</Text></View></View></View></View>
+    <View style={styles.settingsGroup}><Text style={styles.settingsLabel}>数据与隐私</Text><View style={styles.settingsCard}><View style={styles.settingRow}><View style={styles.settingIcon}><Ionicons name="phone-portrait-outline" size={20} color="#5A635B" /></View><View style={styles.settingBody}><Text style={styles.settingName}>本地存储</Text><Text style={styles.settingHint}>当前设备已保存 {cards.length} 张卡片</Text></View><Ionicons name="checkmark-circle" size={21} color="#4E896B" /></View><View style={styles.settingRow}><View style={styles.settingIcon}><Ionicons name="shield-checkmark-outline" size={20} color="#5A635B" /></View><View style={styles.settingBody}><Text style={styles.settingName}>隐私提醒</Text><Text style={styles.settingHint}>请不要保存密码、CVV 等认证信息</Text></View></View><Pressable accessibilityRole="switch" accessibilityState={{ checked: lockEnabled }} accessibilityLabel="应用锁" accessibilityHint="启用后需要设备验证才能查看卡片" onPress={onToggleLock} style={({ pressed }) => [styles.settingRow, pressed && styles.settingRowPressed]}><View style={[styles.settingIcon, lockEnabled && styles.lockSettingIcon]}><Ionicons name={lockEnabled ? 'lock-closed' : 'lock-open-outline'} size={20} color={lockEnabled ? BRAND.gold : '#5A635B'} /></View><View style={styles.settingBody}><Text style={styles.settingName}>应用锁</Text><Text style={styles.settingHint}>{lockEnabled ? '已启用：返回应用时需要验证' : '启用设备指纹或人脸验证'}</Text></View><View pointerEvents="none" style={[styles.lockSwitch, lockEnabled && styles.lockSwitchOn]}><View style={[styles.lockSwitchThumb, lockEnabled && styles.lockSwitchThumbOn]} /></View></Pressable></View></View>
     <View style={styles.settingsGroup}><Text style={styles.settingsLabel}>应用更新</Text><View style={styles.settingsCard}><Pressable accessibilityLabel="检查应用更新" onPress={() => { haptic(); (updateAvailable ? onOpenUpdate : onCheckUpdate)(); }} style={({ pressed }) => [styles.settingRow, pressed && styles.settingRowPressed]}><View style={[styles.settingIcon, updateAvailable && styles.updateIcon]}><Ionicons name={updateAvailable ? 'arrow-down-circle-outline' : 'cloud-download-outline'} size={20} color={updateAvailable ? '#8D5B38' : '#5A635B'} /></View><View style={styles.settingBody}><Text style={styles.settingName}>{updateAvailable ? `下载新版本 ${update.version}` : '检查更新'}</Text><Text style={styles.settingHint}>{update.message}</Text></View>{update.status === 'checking' ? <Ionicons name="sync" size={20} color="#8A6B48" /> : <Ionicons name={updateAvailable ? 'arrow-forward-circle' : 'chevron-forward'} size={21} color={updateAvailable ? '#A36C49' : '#A9ACA5'} />}</Pressable><Text style={styles.updateHelp}>版本信息来自 GitHub；APK 通过国内下载镜像获取。</Text></View></View>
     <View style={styles.settingsGroup}><Text style={styles.settingsLabel}>关于</Text><View style={[styles.settingsCard, styles.aboutCard]}><BrandSignature compact /><Text style={styles.aboutText}>版本 {APP_VERSION} · 离线实体卡管理</Text></View></View><Pressable onPress={() => { haptic('impact'); onReset(); }} style={styles.resetButton}><Text style={styles.resetText}>恢复示例数据</Text></Pressable>
   </ScrollView>;
@@ -366,10 +433,11 @@ function Settings({ cards, update, onCheckUpdate, onOpenUpdate, onReset }) {
 
 const styles = StyleSheet.create({
   brandMark:{overflow:'hidden',backgroundColor:BRAND.ivory,shadowColor:'#4C3E2E',shadowOpacity:.16,shadowOffset:{width:0,height:4},shadowRadius:8,elevation:4},brandMarkImage:{...StyleSheet.absoluteFillObject,width:'100%',height:'100%'},brandSignature:{flexDirection:'row',alignItems:'center',gap:9,marginBottom:12},brandKicker:{fontSize:9,letterSpacing:1.05,fontWeight:'700',color:BRAND.taupe},brandKickerInverse:{color:'rgba(255,247,230,.72)'},brandName:{fontSize:18,lineHeight:23,fontWeight:'800',letterSpacing:-.4,color:BRAND.ink},brandNameCompact:{fontSize:16,lineHeight:20},brandNameInverse:{color:'#FFFDF8'},
+  lockScreen:{flex:1,backgroundColor:BRAND.inkDeep},lockContent:{flex:1,alignItems:'center',justifyContent:'center',paddingHorizontal:34},lockEmblem:{width:92,height:92,borderRadius:46,backgroundColor:'rgba(231,201,145,.12)',borderWidth:1,borderColor:'rgba(231,201,145,.28)',alignItems:'center',justifyContent:'center',marginTop:54,marginBottom:26},lockTitle:{fontSize:27,fontWeight:'800',letterSpacing:-.6,color:'#FFFDF8'},lockBody:{fontSize:14,lineHeight:22,color:'rgba(255,253,248,.68)',textAlign:'center',marginTop:10,maxWidth:270},unlockButton:{width:'100%',height:54,borderRadius:17,backgroundColor:BRAND.goldSoft,marginTop:31,flexDirection:'row',alignItems:'center',justifyContent:'center',gap:8},unlockButtonDisabled:{opacity:.65},unlockButtonPressed:{transform:[{scale:.98}]},unlockButtonText:{fontSize:15,fontWeight:'800',color:BRAND.inkDeep},lockHint:{fontSize:11,color:'rgba(255,253,248,.52)',marginTop:18},
   addRoundPressed:{transform:[{scale:.94}],opacity:.92},heroHalo:{position:'absolute',width:230,height:230,borderRadius:115,right:-78,top:-100,backgroundColor:'rgba(231,201,145,.12)'},heroArchiveLabel:{flexDirection:'row',alignItems:'center',gap:6},heroFootOverline:{fontSize:9,letterSpacing:1.1,fontWeight:'700',color:'rgba(231,201,145,.68)',marginBottom:3},
   textLinkButton:{minHeight:44,paddingHorizontal:3,flexDirection:'row',alignItems:'center',gap:4},textLinkPressed:{opacity:.62},navItemActive:{backgroundColor:'#F1ECE1',borderRadius:18},navItemPressed:{opacity:.72},navIconSlot:{height:25,alignItems:'center',justifyContent:'center'},navDot:{position:'absolute',bottom:-2,width:4,height:4,borderRadius:2,backgroundColor:BRAND.gold},
   detailArchiveHeader:{marginBottom:18,paddingBottom:15,borderBottomWidth:1,borderBottomColor:'#E8E2D8',flexDirection:'row',alignItems:'center',justifyContent:'space-between'},detailArchiveMeta:{flexDirection:'row',alignItems:'center',gap:6,paddingHorizontal:9,paddingVertical:6,borderRadius:12,backgroundColor:'#F3EEE4'},detailArchiveMetaText:{fontSize:10,fontWeight:'700',color:BRAND.taupe},backPhotoMissing:{marginTop:18,height:54,borderRadius:14,backgroundColor:'#F4EFE6',flexDirection:'row',alignItems:'center',justifyContent:'center',gap:8,borderWidth:1,borderColor:'#E6D9C5',borderStyle:'dashed'},backPhotoMissingText:{fontSize:12,color:BRAND.taupe,fontWeight:'600'},
-  settingsCard:{overflow:'hidden',borderRadius:18,borderWidth:1,borderColor:'#E9E4DA',backgroundColor:BRAND.paper,shadowColor:'#41382D',shadowOpacity:.05,shadowOffset:{width:0,height:4},shadowRadius:10,elevation:1},settingRowPressed:{opacity:.68},aboutCard:{padding:16,gap:5},aboutText:{fontSize:12,color:'#777A73',marginLeft:43},
+  settingsCard:{overflow:'hidden',borderRadius:18,borderWidth:1,borderColor:'#E9E4DA',backgroundColor:BRAND.paper,shadowColor:'#41382D',shadowOpacity:.05,shadowOffset:{width:0,height:4},shadowRadius:10,elevation:1},settingRowPressed:{opacity:.68},aboutCard:{padding:16,gap:5},aboutText:{fontSize:12,color:'#777A73',marginLeft:43},lockSettingIcon:{backgroundColor:'#F2E7D5'},lockSwitch:{width:44,height:26,borderRadius:13,padding:3,backgroundColor:'#BEC2B9',justifyContent:'center'},lockSwitchOn:{backgroundColor:BRAND.ink},lockSwitchThumb:{width:20,height:20,borderRadius:10,backgroundColor:'#FFFDF8'},lockSwitchThumbOn:{alignSelf:'flex-end'},
   infoValueWrap:{flex:1,flexDirection:'row',alignItems:'center',justifyContent:'flex-end',gap:8,minWidth:0},infoValueWrapMulti:{alignItems:'flex-start'},infoValueCopy:{flex:0,flexShrink:1},copyButton:{height:36,minWidth:56,paddingHorizontal:9,borderRadius:11,backgroundColor:'#F3EEE4',borderWidth:1,borderColor:'#E4D7C4',flexDirection:'row',alignItems:'center',justifyContent:'center',gap:4},copyButtonDone:{backgroundColor:BRAND.ink,borderColor:BRAND.ink},copyButtonPressed:{opacity:.68,transform:[{scale:.96}]},copyButtonText:{fontSize:11,fontWeight:'700',color:BRAND.taupe},copyButtonTextDone:{color:'#FFFDF8'},
   safe:{flex:1,backgroundColor:'#F6F6F1',paddingTop:Platform.OS==='android'?24:0},loading:{flex:1,justifyContent:'center',alignItems:'center',backgroundColor:'#F6F6F1',paddingTop:Platform.OS==='android'?24:0},loadingText:{color:'#565C55',fontSize:16},screen:{flex:1},screenContent:{paddingTop:20,paddingBottom:98},homeHeader:{paddingHorizontal:22,flexDirection:'row',justifyContent:'space-between',alignItems:'flex-start'},eyebrow:{fontSize:10,letterSpacing:1.8,color:'#8A6B48',fontWeight:'700',marginBottom:6},pageTitle:{fontSize:31,lineHeight:39,color:'#182B25',fontWeight:'700',letterSpacing:-1},pageSubtitle:{fontSize:14,lineHeight:22,color:'#70756D',marginTop:5},addRound:{width:48,height:48,borderRadius:16,backgroundColor:'#182B25',alignItems:'center',justifyContent:'center',shadowColor:'#182B25',shadowOpacity:.18,shadowRadius:10,elevation:4},archiveHero:{marginHorizontal:22,marginTop:22,marginBottom:24,borderRadius:22,padding:20,backgroundColor:'#182B25',minHeight:174,justifyContent:'space-between',shadowColor:'#102019',shadowOpacity:.2,shadowRadius:16,elevation:5},heroTop:{flexDirection:'row',alignItems:'center',justifyContent:'space-between'},heroKicker:{fontSize:10,letterSpacing:1.7,fontWeight:'700',color:'#C8AC7E'},localPill:{flexDirection:'row',alignItems:'center',gap:5,borderWidth:1,borderColor:'rgba(229,210,173,.28)',borderRadius:14,paddingHorizontal:8,paddingVertical:5},localPillText:{fontSize:10,color:'#E5D2AD',fontWeight:'600'},heroTitle:{fontSize:22,lineHeight:30,letterSpacing:-.5,color:'#FCFAF4',fontWeight:'600'},heroFoot:{flexDirection:'row',alignItems:'center',gap:9},heroMark:{width:30,height:30,borderRadius:15,backgroundColor:'#D9BD8B',alignItems:'center',justifyContent:'center'},heroFootText:{fontSize:12,color:'rgba(252,250,244,.74)'},overview:{marginHorizontal:22,marginBottom:30,paddingVertical:16,backgroundColor:'#FEFEFA',borderRadius:18,flexDirection:'row',justifyContent:'space-around',borderWidth:1,borderColor:'#E9E8DF'},stat:{flex:1,flexDirection:'row',alignItems:'center',justifyContent:'center',gap:8},statIcon:{width:30,height:30,borderRadius:10,alignItems:'center',justifyContent:'center'},statValue:{fontSize:15,fontWeight:'700',color:'#182B25'},statLabel:{fontSize:11,color:'#858880',marginTop:1},statDivider:{height:31,width:1,backgroundColor:'#E5E4DC'},sectionHead:{marginHorizontal:22,marginBottom:13,flexDirection:'row',alignItems:'flex-end',justifyContent:'space-between'},sectionTitle:{fontSize:19,fontWeight:'700',color:'#182B25'},sectionHint:{fontSize:12,color:'#858880',marginTop:3},textLink:{fontSize:13,color:'#8A6241',fontWeight:'600',padding:7},featuredList:{paddingLeft:22,paddingRight:8,gap:14,paddingBottom:30},featuredItem:{width:230},featuredName:{fontSize:15,fontWeight:'700',color:'#182B25',marginTop:11},featuredMeta:{fontSize:12,color:'#82857E',marginTop:4},cardVisual:{height:144,borderRadius:17,overflow:'hidden',padding:16,justifyContent:'space-between',shadowColor:'#34312C',shadowOpacity:.18,shadowOffset:{width:0,height:5},shadowRadius:12,elevation:5},cardVisualCompact:{width:104,height:70,borderRadius:11,padding:9,shadowOpacity:.1,elevation:2},cardImage:{...StyleSheet.absoluteFillObject,width:'100%',height:'100%',resizeMode:'cover'},cardShade:{...StyleSheet.absoluteFillObject,backgroundColor:'rgba(15,19,17,.18)'},cardTop:{flexDirection:'row',justifyContent:'space-between',alignItems:'center'},cardIssuer:{color:'#fff',fontSize:12,fontWeight:'600',maxWidth:'80%'},cardBottom:{gap:5},cardNumber:{color:'#fff',fontSize:17,letterSpacing:1.6,fontWeight:'500'},cardNumberCompact:{fontSize:10,letterSpacing:.8},cardNameOnCard:{color:'rgba(255,255,255,.88)',fontSize:12,fontWeight:'500'},emptyCompact:{height:108,borderRadius:16,borderWidth:1,borderStyle:'dashed',borderColor:'#D4C2AA',marginHorizontal:22,marginBottom:30,alignItems:'center',justifyContent:'center',gap:8},emptyCompactText:{fontSize:13,color:'#817565'},cardRow:{flexDirection:'row',alignItems:'center',gap:13,paddingVertical:11,paddingHorizontal:22,backgroundColor:'#F6F6F1'},pressed:{opacity:.68},rowInfo:{flex:1,minWidth:0},rowTitleLine:{flexDirection:'row',alignItems:'center',gap:6},rowName:{fontSize:16,fontWeight:'650',color:'#182B25',flexShrink:1},rowIssuer:{fontSize:13,color:'#7E8279',marginTop:3},rowFoot:{flexDirection:'row',alignItems:'center',marginTop:7,gap:5},categoryDot:{width:6,height:6,borderRadius:3},rowCategory:{fontSize:11,color:'#777B73'},rowExpiry:{fontSize:11,color:'#94968F',marginLeft:5},collectionTop:{paddingTop:18,paddingHorizontal:22,paddingBottom:16},searchBox:{height:47,backgroundColor:'#ECEDE7',borderRadius:14,marginTop:20,paddingHorizontal:14,flexDirection:'row',alignItems:'center',gap:9},searchInput:{flex:1,fontSize:15,color:'#182B25',height:'100%'},filterWrap:{height:47,borderBottomWidth:1,borderBottomColor:'#E6E5DE'},filterList:{paddingHorizontal:22,gap:8,alignItems:'center'},filter:{height:31,paddingHorizontal:13,borderRadius:16,backgroundColor:'#E9E9E3',justifyContent:'center'},filterActive:{backgroundColor:'#182B25'},filterText:{fontSize:13,color:'#686C65'},filterTextActive:{color:'#fff',fontWeight:'600'},collectionList:{paddingBottom:98},emptyState:{alignItems:'center',paddingTop:80,paddingHorizontal:38},emptyIcon:{width:64,height:64,borderRadius:22,backgroundColor:'#EEE6D9',alignItems:'center',justifyContent:'center'},emptyTitle:{fontSize:17,fontWeight:'700',color:'#182B25',marginTop:16},emptyBody:{fontSize:13,color:'#858880',textAlign:'center',lineHeight:20,marginTop:7},emptyButton:{marginTop:20,backgroundColor:'#182B25',borderRadius:12,paddingHorizontal:18,paddingVertical:11},emptyButtonText:{color:'#fff',fontWeight:'600'},bottomNav:{position:'absolute',bottom:0,left:0,right:0,height:72,paddingHorizontal:20,paddingBottom:Platform.OS==='android'?6:0,backgroundColor:'rgba(254,254,250,.98)',borderTopWidth:1,borderTopColor:'#E5E3DC',flexDirection:'row',alignItems:'center',justifyContent:'space-around'},navItem:{flex:1,height:54,alignItems:'center',justifyContent:'center',gap:3},navText:{fontSize:10,color:'#7A7E76'},navTextActive:{color:'#182B25',fontWeight:'700'},modalShell:{flex:1,justifyContent:'flex-end'},backdrop:{...StyleSheet.absoluteFillObject,backgroundColor:'rgba(22,26,23,.46)'},detailSheet:{backgroundColor:'#FAFAF6',borderTopLeftRadius:28,borderTopRightRadius:28,maxHeight:'90%'},detailSheetContent:{paddingHorizontal:22,paddingBottom:34},sheetHandle:{height:4,width:38,borderRadius:2,backgroundColor:'#C7C9C1',alignSelf:'center',marginTop:10},detailActions:{height:62,flexDirection:'row',justifyContent:'space-between',alignItems:'center'},detailActionRight:{flexDirection:'row',gap:8},iconButton:{height:44,width:44,borderRadius:22,alignItems:'center',justifyContent:'center',backgroundColor:'#EFF0EB'},photoSectionLabel:{fontSize:12,fontWeight:'700',letterSpacing:.7,color:'#8A6B48',marginBottom:9},backPhotoBlock:{marginTop:20},backCardImage:{width:'100%',height:180,borderRadius:16,resizeMode:'cover',backgroundColor:'#E8E8E2'},detailName:{fontSize:25,fontWeight:'700',color:'#182B25',marginTop:20},detailIssuer:{fontSize:14,color:'#7E827A',marginTop:4},detailInfo:{marginTop:23,borderTopWidth:1,borderTopColor:'#E5E5DE'},infoLine:{minHeight:55,borderBottomWidth:1,borderBottomColor:'#E5E5DE',flexDirection:'row',alignItems:'center',justifyContent:'space-between',gap:14},infoLineTop:{paddingVertical:14,alignItems:'flex-start'},infoLabel:{flexDirection:'row',alignItems:'center',gap:8,minWidth:95},infoLabelText:{fontSize:13,color:'#72766E'},infoValue:{fontSize:14,color:'#182B25',fontWeight:'500',flex:1,textAlign:'right'},infoValueMulti:{lineHeight:20,fontWeight:'400'},deleteButton:{marginTop:22,height:48,borderRadius:13,borderWidth:1,borderColor:'#E8C6C7',alignItems:'center',justifyContent:'center',flexDirection:'row',gap:8},deleteText:{fontSize:14,fontWeight:'600',color:'#B54A52'},editorSafe:{flex:1,backgroundColor:'#F7F7F2'},editorHead:{height:58,paddingHorizontal:17,flexDirection:'row',alignItems:'center',justifyContent:'space-between',backgroundColor:'#FCFCF8',borderBottomWidth:1,borderBottomColor:'#E8E7E0'},editorTitle:{fontSize:16,fontWeight:'700',color:'#182B25'},editorCancel:{minWidth:45,paddingVertical:10},editorCancelText:{color:'#6D716A',fontSize:15},editorSave:{backgroundColor:'#182B25',borderRadius:9,paddingHorizontal:13,paddingVertical:7},editorSaveText:{color:'#fff',fontSize:14,fontWeight:'700'},editorContent:{padding:20,paddingBottom:45},photoHelper:{fontSize:12,color:'#7E817A',lineHeight:18,marginTop:-1,marginBottom:13},photoPicker:{position:'relative',marginBottom:14},photoHint:{position:'absolute',bottom:10,alignSelf:'center',backgroundColor:'rgba(255,253,247,.9)',borderRadius:18,paddingHorizontal:12,paddingVertical:7,flexDirection:'row',alignItems:'center',gap:5},photoHintText:{fontSize:12,fontWeight:'600',color:'#5C574D'},backPhotoPicker:{height:150,borderRadius:16,overflow:'hidden',backgroundColor:'#EBEAE3',marginBottom:26,position:'relative'},backPhotoPlaceholder:{flex:1,alignItems:'center',justifyContent:'center',gap:5,borderWidth:1,borderStyle:'dashed',borderColor:'#CFC3B0',borderRadius:16},backPhotoTitle:{fontSize:14,fontWeight:'700',color:'#5A5144'},backPhotoHint:{fontSize:12,color:'#82786A'},backPhotoBadge:{position:'absolute',bottom:10,alignSelf:'center',backgroundColor:'rgba(255,253,247,.92)',borderRadius:18,paddingHorizontal:12,paddingVertical:7,flexDirection:'row',alignItems:'center',gap:5},backPhotoBadgeText:{fontSize:12,fontWeight:'600',color:'#5C574D'},formSection:{fontSize:13,fontWeight:'700',letterSpacing:.6,color:'#8A6B48',marginBottom:5},field:{marginTop:16},fieldLabel:{fontSize:13,color:'#555A53',fontWeight:'600',marginBottom:8},input:{minHeight:48,borderWidth:1,borderColor:'#DEDCD4',backgroundColor:'#FCFCF8',borderRadius:12,paddingHorizontal:13,fontSize:15,color:'#182B25'},inputMulti:{height:92,paddingTop:12},categoryList:{gap:8,paddingBottom:3},categoryChoice:{height:39,borderRadius:11,borderWidth:1,borderColor:'#DFDED6',paddingHorizontal:11,flexDirection:'row',alignItems:'center',gap:6,backgroundColor:'#FCFCF8'},categoryChoiceText:{fontSize:13,fontWeight:'600',color:'#4F554E'},colorList:{flexDirection:'row',gap:13,marginBottom:4},colorDot:{width:30,height:30,borderRadius:15,alignItems:'center',justifyContent:'center'},colorDotActive:{borderWidth:2,borderColor:'#F7F7F2',shadowColor:'#333',shadowOpacity:.3,shadowRadius:3,elevation:3},favoriteToggle:{marginTop:23,padding:14,borderRadius:14,backgroundColor:'#ECEDE7',flexDirection:'row',gap:12,alignItems:'center'},switchTrack:{width:40,height:24,borderRadius:12,backgroundColor:'#B5B8B0',padding:3,justifyContent:'center'},switchTrackOn:{backgroundColor:'#8A6241'},switchThumb:{width:18,height:18,borderRadius:9,backgroundColor:'#fff'},switchThumbOn:{alignSelf:'flex-end'},favoriteLabel:{fontSize:14,fontWeight:'700',color:'#182B25'},favoriteHelp:{fontSize:12,color:'#7C8078',marginTop:2},privacyBox:{marginTop:16,flexDirection:'row',gap:9,padding:12,backgroundColor:'#F1E9DE',borderRadius:12},privacyText:{fontSize:12,color:'#716658',lineHeight:18,flex:1},settingsContent:{padding:22,paddingBottom:98},settingsGroup:{marginTop:28},settingsLabel:{fontSize:12,fontWeight:'700',letterSpacing:.6,color:'#8A6B48',marginBottom:9},settingRow:{minHeight:72,backgroundColor:'#FEFEFA',borderBottomWidth:1,borderBottomColor:'#E7E6E0',padding:13,flexDirection:'row',alignItems:'center',gap:12},settingIcon:{width:38,height:38,borderRadius:12,backgroundColor:'#E8ECE5',alignItems:'center',justifyContent:'center'},settingBody:{flex:1},settingName:{fontSize:15,fontWeight:'650',color:'#182B25'},settingHint:{fontSize:12,color:'#7E817A',marginTop:3},updateIcon:{backgroundColor:'#F1E3D0'},updateHelp:{fontSize:12,color:'#83867E',lineHeight:18,paddingHorizontal:13,paddingTop:9,backgroundColor:'#FEFEFA'},resetButton:{alignSelf:'center',marginTop:38,paddingVertical:9,paddingHorizontal:12},resetText:{fontSize:13,color:'#A24E54'}
 });
