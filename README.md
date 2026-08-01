@@ -32,7 +32,7 @@ npm run apk
 2. 运行 `npm run apk`；
 3. 在 GitHub 创建形如 `v1.0.1` 的 Release，并将生成的 `app-release.apk` 作为附件上传。
 
-用户在应用的“设置 → 检查更新”中即可跳转下载最新版 APK。
+用户在应用的“设置 → 检查更新”中即可跳转下载最新版 APK。版本信息直接读取 GitHub，APK 下载链接会通过 `gh-proxy.com` 镜像加速；若 Release 没有 APK 附件，则打开 GitHub 的 Release 页面。
 
 ## 隐私说明
 
