@@ -5,14 +5,14 @@ import * as ImagePicker from 'expo-image-picker';
 import * as Linking from 'expo-linking';
 import { StatusBar } from 'expo-status-bar';
 import { Ionicons } from '@expo/vector-icons';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { Gesture, GestureDetector, GestureHandlerRootView } from 'react-native-gesture-handler';
+import Animated, { Extrapolation, interpolate, runOnJS, useAnimatedStyle, useSharedValue, withSpring } from 'react-native-reanimated';
+import { useEffect, useMemo, useState } from 'react';
 import {
   Alert,
-  Animated,
   FlatList,
   Image,
   Modal,
-  PanResponder,
   Platform,
   Pressable,
   SafeAreaView,
@@ -24,7 +24,7 @@ import {
 } from 'react-native';
 
 const STORAGE_KEY = '@card-cabinet/cards-v1';
-const APP_VERSION = '1.0.1';
+const APP_VERSION = '1.0.2';
 const RELEASES_API = 'https://api.github.com/repos/Cunninger/card-case/releases/latest';
 const RELEASE_ASSET_MIRROR = 'https://gh-proxy.com/';
 const CATEGORIES = [
@@ -93,25 +93,49 @@ function CardShowcase({ cards, onOpen, onCreate }) {
   </Pressable>;
 }
 
+function FanCard({ card, index, progress, activeIndex, onPress }) {
+  const motionStyle = useAnimatedStyle(() => {
+    const offset = index - progress.value;
+    const distance = Math.abs(offset);
+    return {
+      opacity: interpolate(distance, [0, 1, 3], [1, 0.8, 0.3], Extrapolation.CLAMP),
+      transform: [
+        { translateX: interpolate(offset, [-3, 0, 3], [-153, 0, 153], Extrapolation.CLAMP) },
+        { translateY: interpolate(distance, [0, 1, 3], [0, 14, 42], Extrapolation.CLAMP) },
+        { rotate: `${interpolate(offset, [-3, 0, 3], [-30, 0, 30], Extrapolation.CLAMP)}deg` },
+        { scale: interpolate(distance, [0, 1, 3], [1, 0.9, 0.8], Extrapolation.CLAMP) },
+      ],
+    };
+  });
+  return <Animated.View style={[fanStyles.cardTouch, { zIndex: 20 - Math.abs(index - activeIndex) }, motionStyle]}><Pressable accessibilityLabel={`选择 ${card.name}`} onPress={onPress} style={fanStyles.cardPress}><CardVisual card={card} style={fanStyles.card} /></Pressable></Animated.View>;
+}
+
 function FanDeck({ open, cards, onClose, onSelect }) {
   const deck = cards.slice(0, 7);
   const [activeIndex, setActiveIndex] = useState(0);
-  const [dragX] = useState(() => new Animated.Value(0));
-  const resetDrag = useCallback(() => Animated.spring(dragX, { toValue: 0, useNativeDriver: true, speed: 18, bounciness: 5 }).start(), [dragX]);
-  const panResponder = useMemo(() => PanResponder.create({
-    onMoveShouldSetPanResponder: (_, gesture) => Math.abs(gesture.dx) > 10 && Math.abs(gesture.dx) > Math.abs(gesture.dy),
-    onPanResponderMove: (_, gesture) => dragX.setValue(Math.max(-58, Math.min(58, gesture.dx * 0.35))),
-    onPanResponderRelease: (_, gesture) => {
-      if (gesture.dx < -58 && activeIndex < deck.length - 1) setActiveIndex(activeIndex + 1);
-      if (gesture.dx > 58 && activeIndex > 0) setActiveIndex(activeIndex - 1);
-      resetDrag();
-    },
-    onPanResponderTerminate: resetDrag,
-  }), [activeIndex, deck.length, dragX, resetDrag]);
+  const progress = useSharedValue(0);
+  const gestureStart = useSharedValue(0);
+  const commitIndex = (index) => setActiveIndex(index);
+  const choose = (index) => {
+    const target = Math.max(0, Math.min(deck.length - 1, index));
+    progress.value = withSpring(target, { damping: 17, stiffness: 190, mass: 0.68 });
+    setActiveIndex(target);
+  };
+  const pan = Gesture.Pan().activeOffsetX([-10, 10]).failOffsetY([-18, 18]).onBegin(() => { gestureStart.value = progress.value; }).onUpdate((event) => {
+    const raw = gestureStart.value - event.translationX / 155;
+    const resisted = raw < 0 ? raw * 0.28 : raw > deck.length - 1 ? (deck.length - 1) + (raw - (deck.length - 1)) * 0.28 : raw;
+    progress.value = resisted;
+  }).onEnd((event) => {
+    const start = Math.round(gestureStart.value);
+    const flingOffset = -event.velocityX / 1200;
+    const rawTarget = Math.round(progress.value + flingOffset);
+    const target = Math.max(Math.max(0, start - 2), Math.min(Math.min(deck.length - 1, start + 2), rawTarget));
+    progress.value = withSpring(target, { damping: 17, stiffness: 190, mass: 0.68 });
+    runOnJS(commitIndex)(target);
+  });
   if (!open) return null;
   const activeCard = deck[activeIndex];
-  const choose = (index) => setActiveIndex(index);
-  return <Modal visible transparent animationType="fade" onRequestClose={onClose}><SafeAreaView style={fanStyles.safe}><View style={fanStyles.header}><Pressable accessibilityLabel="关闭卡册" onPress={onClose} style={fanStyles.closeButton}><Ionicons name="close" size={24} color="#F9F7F0" /></Pressable><View><Text style={fanStyles.kicker}>PRIVATE CARD BOOK</Text><Text style={fanStyles.title}>扇形卡册</Text></View><Text style={fanStyles.counter}>{activeIndex + 1} / {deck.length}</Text></View><Text style={fanStyles.hint}>左右滑动切换 · 点选侧边卡片置中</Text><Animated.View {...panResponder.panHandlers} style={[fanStyles.stage, { transform: [{ translateX: dragX }] }]}>{deck.map((card, index) => { const offset = index - activeIndex; const distance = Math.abs(offset); return <Pressable key={card.id} accessibilityLabel={`选择 ${card.name}`} onPress={() => choose(index)} style={[fanStyles.cardTouch, { zIndex: 20 - distance, transform: [{ translateX: offset * 51 }, { translateY: distance * 14 }, { rotate: `${offset * 11}deg` }, { scale: index === activeIndex ? 1 : 0.9 }], opacity: index === activeIndex ? 1 : 0.72 }]}><CardVisual card={card} style={fanStyles.card} /></Pressable>; })}</Animated.View><View style={fanStyles.footer}><View style={fanStyles.pager}><Pressable accessibilityLabel="上一张卡片" disabled={activeIndex === 0} onPress={() => choose(activeIndex - 1)} style={[fanStyles.arrowButton, activeIndex === 0 && fanStyles.arrowDisabled]}><Ionicons name="chevron-back" size={22} color="#F9F7F0" /></Pressable><View style={fanStyles.caption}><Text numberOfLines={1} style={fanStyles.cardName}>{activeCard?.name}</Text><Text numberOfLines={1} style={fanStyles.cardMeta}>{categoryFor(activeCard?.category).name} · {activeCard?.issuer || '未填写机构'}</Text></View><Pressable accessibilityLabel="下一张卡片" disabled={activeIndex === deck.length - 1} onPress={() => choose(activeIndex + 1)} style={[fanStyles.arrowButton, activeIndex === deck.length - 1 && fanStyles.arrowDisabled]}><Ionicons name="chevron-forward" size={22} color="#F9F7F0" /></Pressable></View><Pressable accessibilityLabel={`查看 ${activeCard?.name} 的档案`} onPress={() => onSelect(activeCard)} style={fanStyles.detailButton}><Text style={fanStyles.detailButtonText}>查看档案</Text><Ionicons name="arrow-forward" size={18} color="#142E27" /></Pressable></View></SafeAreaView></Modal>;
+  return <Modal visible transparent animationType="fade" onRequestClose={onClose}><GestureHandlerRootView style={fanStyles.gestureRoot}><SafeAreaView style={fanStyles.safe}><View style={fanStyles.header}><Pressable accessibilityLabel="关闭卡册" onPress={onClose} style={fanStyles.closeButton}><Ionicons name="close" size={24} color="#F9F7F0" /></Pressable><View><Text style={fanStyles.kicker}>PRIVATE CARD BOOK</Text><Text style={fanStyles.title}>扇形卡册</Text></View><Text style={fanStyles.counter}>{activeIndex + 1} / {deck.length}</Text></View><Text style={fanStyles.hint}>轻滑切换 · 快速甩动可跨两张</Text><GestureDetector gesture={pan}><View style={fanStyles.stage}>{deck.map((card, index) => <FanCard key={card.id} card={card} index={index} progress={progress} activeIndex={activeIndex} onPress={() => choose(index)} />)}</View></GestureDetector><View style={fanStyles.footer}><View style={fanStyles.pager}><Pressable accessibilityLabel="上一张卡片" disabled={activeIndex === 0} onPress={() => choose(activeIndex - 1)} style={[fanStyles.arrowButton, activeIndex === 0 && fanStyles.arrowDisabled]}><Ionicons name="chevron-back" size={22} color="#F9F7F0" /></Pressable><View style={fanStyles.caption}><Text numberOfLines={1} style={fanStyles.cardName}>{activeCard?.name}</Text><Text numberOfLines={1} style={fanStyles.cardMeta}>{categoryFor(activeCard?.category).name} · {activeCard?.issuer || '未填写机构'}</Text></View><Pressable accessibilityLabel="下一张卡片" disabled={activeIndex === deck.length - 1} onPress={() => choose(activeIndex + 1)} style={[fanStyles.arrowButton, activeIndex === deck.length - 1 && fanStyles.arrowDisabled]}><Ionicons name="chevron-forward" size={22} color="#F9F7F0" /></Pressable></View><Pressable accessibilityLabel={`查看 ${activeCard?.name} 的档案`} onPress={() => onSelect(activeCard)} style={fanStyles.detailButton}><Text style={fanStyles.detailButtonText}>查看档案</Text><Ionicons name="arrow-forward" size={18} color="#142E27" /></Pressable></View></SafeAreaView></GestureHandlerRootView></Modal>;
 }
 
 export default function App() {
@@ -287,6 +311,7 @@ const showcaseStyles = StyleSheet.create({
 });
 
 const fanStyles = StyleSheet.create({
+  gestureRoot: { flex: 1 },
   safe: { flex: 1, backgroundColor: '#102B24', paddingTop: Platform.OS === 'android' ? 24 : 0 },
   header: { height: 76, paddingHorizontal: 22, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   closeButton: { width: 48, height: 48, borderRadius: 24, backgroundColor: 'rgba(255,255,255,.11)', alignItems: 'center', justifyContent: 'center' },
@@ -296,6 +321,7 @@ const fanStyles = StyleSheet.create({
   hint: { color: 'rgba(249,247,240,.64)', textAlign: 'center', fontSize: 12, marginTop: 10 },
   stage: { height: 380, marginTop: 26, position: 'relative', alignItems: 'center', justifyContent: 'center' },
   cardTouch: { position: 'absolute', width: 240, height: 154, left: '50%', marginLeft: -120 },
+  cardPress: { flex: 1 },
   card: { width: 240, height: 154, borderRadius: 20, shadowColor: '#000', shadowOpacity: 0.32, shadowOffset: { width: 0, height: 9 }, shadowRadius: 15, elevation: 9 },
   footer: { marginTop: 'auto', paddingHorizontal: 22, paddingBottom: 28 },
   pager: { minHeight: 64, flexDirection: 'row', alignItems: 'center', gap: 12, marginBottom: 16 },
