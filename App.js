@@ -5,12 +5,14 @@ import * as ImagePicker from 'expo-image-picker';
 import * as Linking from 'expo-linking';
 import { StatusBar } from 'expo-status-bar';
 import { Ionicons } from '@expo/vector-icons';
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Alert,
+  Animated,
   FlatList,
   Image,
   Modal,
+  PanResponder,
   Platform,
   Pressable,
   SafeAreaView,
@@ -94,10 +96,22 @@ function CardShowcase({ cards, onOpen, onCreate }) {
 function FanDeck({ open, cards, onClose, onSelect }) {
   const deck = cards.slice(0, 7);
   const [activeIndex, setActiveIndex] = useState(0);
+  const [dragX] = useState(() => new Animated.Value(0));
+  const resetDrag = useCallback(() => Animated.spring(dragX, { toValue: 0, useNativeDriver: true, speed: 18, bounciness: 5 }).start(), [dragX]);
+  const panResponder = useMemo(() => PanResponder.create({
+    onMoveShouldSetPanResponder: (_, gesture) => Math.abs(gesture.dx) > 10 && Math.abs(gesture.dx) > Math.abs(gesture.dy),
+    onPanResponderMove: (_, gesture) => dragX.setValue(Math.max(-58, Math.min(58, gesture.dx * 0.35))),
+    onPanResponderRelease: (_, gesture) => {
+      if (gesture.dx < -58 && activeIndex < deck.length - 1) setActiveIndex(activeIndex + 1);
+      if (gesture.dx > 58 && activeIndex > 0) setActiveIndex(activeIndex - 1);
+      resetDrag();
+    },
+    onPanResponderTerminate: resetDrag,
+  }), [activeIndex, deck.length, dragX, resetDrag]);
   if (!open) return null;
   const activeCard = deck[activeIndex];
   const choose = (index) => setActiveIndex(index);
-  return <Modal visible transparent animationType="fade" onRequestClose={onClose}><SafeAreaView style={fanStyles.safe}><View style={fanStyles.header}><Pressable accessibilityLabel="关闭卡册" onPress={onClose} style={fanStyles.closeButton}><Ionicons name="close" size={24} color="#F9F7F0" /></Pressable><View><Text style={fanStyles.kicker}>PRIVATE CARD BOOK</Text><Text style={fanStyles.title}>扇形卡册</Text></View><Text style={fanStyles.counter}>{activeIndex + 1} / {deck.length}</Text></View><Text style={fanStyles.hint}>点选侧边卡片置中 · 选择后查看完整档案</Text><View style={fanStyles.stage}>{deck.map((card, index) => { const offset = index - activeIndex; const distance = Math.abs(offset); return <Pressable key={card.id} accessibilityLabel={`选择 ${card.name}`} onPress={() => choose(index)} style={[fanStyles.cardTouch, { zIndex: 20 - distance, transform: [{ translateX: offset * 51 }, { translateY: distance * 14 }, { rotate: `${offset * 11}deg` }, { scale: index === activeIndex ? 1 : 0.9 }], opacity: index === activeIndex ? 1 : 0.72 }]}><CardVisual card={card} style={fanStyles.card} /></Pressable>; })}</View><View style={fanStyles.footer}><View style={fanStyles.pager}><Pressable accessibilityLabel="上一张卡片" disabled={activeIndex === 0} onPress={() => choose(activeIndex - 1)} style={[fanStyles.arrowButton, activeIndex === 0 && fanStyles.arrowDisabled]}><Ionicons name="chevron-back" size={22} color="#F9F7F0" /></Pressable><View style={fanStyles.caption}><Text numberOfLines={1} style={fanStyles.cardName}>{activeCard?.name}</Text><Text numberOfLines={1} style={fanStyles.cardMeta}>{categoryFor(activeCard?.category).name} · {activeCard?.issuer || '未填写机构'}</Text></View><Pressable accessibilityLabel="下一张卡片" disabled={activeIndex === deck.length - 1} onPress={() => choose(activeIndex + 1)} style={[fanStyles.arrowButton, activeIndex === deck.length - 1 && fanStyles.arrowDisabled]}><Ionicons name="chevron-forward" size={22} color="#F9F7F0" /></Pressable></View><Pressable accessibilityLabel={`查看 ${activeCard?.name} 的档案`} onPress={() => onSelect(activeCard)} style={fanStyles.detailButton}><Text style={fanStyles.detailButtonText}>查看档案</Text><Ionicons name="arrow-forward" size={18} color="#142E27" /></Pressable></View></SafeAreaView></Modal>;
+  return <Modal visible transparent animationType="fade" onRequestClose={onClose}><SafeAreaView style={fanStyles.safe}><View style={fanStyles.header}><Pressable accessibilityLabel="关闭卡册" onPress={onClose} style={fanStyles.closeButton}><Ionicons name="close" size={24} color="#F9F7F0" /></Pressable><View><Text style={fanStyles.kicker}>PRIVATE CARD BOOK</Text><Text style={fanStyles.title}>扇形卡册</Text></View><Text style={fanStyles.counter}>{activeIndex + 1} / {deck.length}</Text></View><Text style={fanStyles.hint}>左右滑动切换 · 点选侧边卡片置中</Text><Animated.View {...panResponder.panHandlers} style={[fanStyles.stage, { transform: [{ translateX: dragX }] }]}>{deck.map((card, index) => { const offset = index - activeIndex; const distance = Math.abs(offset); return <Pressable key={card.id} accessibilityLabel={`选择 ${card.name}`} onPress={() => choose(index)} style={[fanStyles.cardTouch, { zIndex: 20 - distance, transform: [{ translateX: offset * 51 }, { translateY: distance * 14 }, { rotate: `${offset * 11}deg` }, { scale: index === activeIndex ? 1 : 0.9 }], opacity: index === activeIndex ? 1 : 0.72 }]}><CardVisual card={card} style={fanStyles.card} /></Pressable>; })}</Animated.View><View style={fanStyles.footer}><View style={fanStyles.pager}><Pressable accessibilityLabel="上一张卡片" disabled={activeIndex === 0} onPress={() => choose(activeIndex - 1)} style={[fanStyles.arrowButton, activeIndex === 0 && fanStyles.arrowDisabled]}><Ionicons name="chevron-back" size={22} color="#F9F7F0" /></Pressable><View style={fanStyles.caption}><Text numberOfLines={1} style={fanStyles.cardName}>{activeCard?.name}</Text><Text numberOfLines={1} style={fanStyles.cardMeta}>{categoryFor(activeCard?.category).name} · {activeCard?.issuer || '未填写机构'}</Text></View><Pressable accessibilityLabel="下一张卡片" disabled={activeIndex === deck.length - 1} onPress={() => choose(activeIndex + 1)} style={[fanStyles.arrowButton, activeIndex === deck.length - 1 && fanStyles.arrowDisabled]}><Ionicons name="chevron-forward" size={22} color="#F9F7F0" /></Pressable></View><Pressable accessibilityLabel={`查看 ${activeCard?.name} 的档案`} onPress={() => onSelect(activeCard)} style={fanStyles.detailButton}><Text style={fanStyles.detailButtonText}>查看档案</Text><Ionicons name="arrow-forward" size={18} color="#142E27" /></Pressable></View></SafeAreaView></Modal>;
 }
 
 export default function App() {
