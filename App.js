@@ -76,11 +76,11 @@ function Stat({ icon, label, value, tone }) {
   return <View style={styles.stat}><View style={[styles.statIcon, { backgroundColor: tone }]}><Ionicons name={icon} size={18} color="#fff" /></View><View><Text style={styles.statValue}>{value}</Text><Text style={styles.statLabel}>{label}</Text></View></View>;
 }
 
-function CardShowcase({ cards, onSelect, onCreate }) {
+function CardShowcase({ cards, onOpen, onCreate }) {
   if (!cards.length) return <Pressable accessibilityLabel="收录第一张卡片" onPress={onCreate} style={showcaseStyles.showcaseEmpty}><Ionicons name="sparkles-outline" size={25} color="#D9BD8B" /><View><Text style={showcaseStyles.showcaseEmptyTitle}>建立你的第一组收藏</Text><Text style={showcaseStyles.showcaseEmptyHint}>收录一张实体卡，开启卡片展台</Text></View><Ionicons name="add-circle-outline" size={25} color="#D9BD8B" /></Pressable>;
   const deck = cards.slice(0, 3);
   const main = deck[0];
-  return <Pressable accessibilityLabel={`打开展台中的 ${main.name}`} accessibilityHint="查看这张卡片的完整档案" onPress={() => onSelect(main)} style={({ pressed }) => [showcaseStyles.showcase, pressed && showcaseStyles.showcasePressed]}>
+  return <Pressable accessibilityLabel={`打开卡片展台，目前主卡为 ${main.name}`} accessibilityHint="打开扇形卡册并浏览其他卡片" onPress={onOpen} style={({ pressed }) => [showcaseStyles.showcase, pressed && showcaseStyles.showcasePressed]}>
     <View pointerEvents="none" style={showcaseStyles.showcaseOrbOne} /><View pointerEvents="none" style={showcaseStyles.showcaseOrbTwo} />
     <View style={showcaseStyles.showcaseHead}><View><Text style={showcaseStyles.showcaseKicker}>CURATED DECK</Text><Text style={showcaseStyles.showcaseTitle}>本周展台</Text></View><View style={showcaseStyles.showcaseOpen}><Text style={showcaseStyles.showcaseOpenText}>轻触打开</Text><Ionicons name="arrow-forward" size={14} color="#E8D6B6" /></View></View>
     <View pointerEvents="none" style={showcaseStyles.showcaseDeck}>
@@ -89,6 +89,15 @@ function CardShowcase({ cards, onSelect, onCreate }) {
       <CardVisual card={main} style={showcaseStyles.showcaseCardFront} />
     </View>
   </Pressable>;
+}
+
+function FanDeck({ open, cards, onClose, onSelect }) {
+  const deck = cards.slice(0, 7);
+  const [activeIndex, setActiveIndex] = useState(0);
+  if (!open) return null;
+  const activeCard = deck[activeIndex];
+  const choose = (index) => setActiveIndex(index);
+  return <Modal visible transparent animationType="fade" onRequestClose={onClose}><SafeAreaView style={fanStyles.safe}><View style={fanStyles.header}><Pressable accessibilityLabel="关闭卡册" onPress={onClose} style={fanStyles.closeButton}><Ionicons name="close" size={24} color="#F9F7F0" /></Pressable><View><Text style={fanStyles.kicker}>PRIVATE CARD BOOK</Text><Text style={fanStyles.title}>扇形卡册</Text></View><Text style={fanStyles.counter}>{activeIndex + 1} / {deck.length}</Text></View><Text style={fanStyles.hint}>点选侧边卡片置中 · 选择后查看完整档案</Text><View style={fanStyles.stage}>{deck.map((card, index) => { const offset = index - activeIndex; const distance = Math.abs(offset); return <Pressable key={card.id} accessibilityLabel={`选择 ${card.name}`} onPress={() => choose(index)} style={[fanStyles.cardTouch, { zIndex: 20 - distance, transform: [{ translateX: offset * 51 }, { translateY: distance * 14 }, { rotate: `${offset * 11}deg` }, { scale: index === activeIndex ? 1 : 0.9 }], opacity: index === activeIndex ? 1 : 0.72 }]}><CardVisual card={card} style={fanStyles.card} /></Pressable>; })}</View><View style={fanStyles.footer}><View style={fanStyles.pager}><Pressable accessibilityLabel="上一张卡片" disabled={activeIndex === 0} onPress={() => choose(activeIndex - 1)} style={[fanStyles.arrowButton, activeIndex === 0 && fanStyles.arrowDisabled]}><Ionicons name="chevron-back" size={22} color="#F9F7F0" /></Pressable><View style={fanStyles.caption}><Text numberOfLines={1} style={fanStyles.cardName}>{activeCard?.name}</Text><Text numberOfLines={1} style={fanStyles.cardMeta}>{categoryFor(activeCard?.category).name} · {activeCard?.issuer || '未填写机构'}</Text></View><Pressable accessibilityLabel="下一张卡片" disabled={activeIndex === deck.length - 1} onPress={() => choose(activeIndex + 1)} style={[fanStyles.arrowButton, activeIndex === deck.length - 1 && fanStyles.arrowDisabled]}><Ionicons name="chevron-forward" size={22} color="#F9F7F0" /></Pressable></View><Pressable accessibilityLabel={`查看 ${activeCard?.name} 的档案`} onPress={() => onSelect(activeCard)} style={fanStyles.detailButton}><Text style={fanStyles.detailButtonText}>查看档案</Text><Ionicons name="arrow-forward" size={18} color="#142E27" /></Pressable></View></SafeAreaView></Modal>;
 }
 
 export default function App() {
@@ -101,6 +110,7 @@ export default function App() {
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState('all');
   const [selected, setSelected] = useState(null);
+  const [showcaseOpen, setShowcaseOpen] = useState(false);
   const [editorOpen, setEditorOpen] = useState(false);
   const [draft, setDraft] = useState(emptyDraft());
   const [update, setUpdate] = useState({ status: 'idle', message: `当前版本 ${APP_VERSION}` });
@@ -181,21 +191,22 @@ export default function App() {
   if (!ready || !iconsReady) return <SafeAreaView style={styles.loading}><Text style={styles.loadingText}>正在打开你的卡匣…</Text></SafeAreaView>;
 
   return <SafeAreaView style={styles.safe}><StatusBar style="dark" backgroundColor="#F6F6F1" />
-    {tab === 'home' ? <Home cards={cards} favorites={favorites} expiring={expiring} onCreate={beginCreate} onSelect={setSelected} onShowAll={() => setTab('cards')} /> : null}
+    {tab === 'home' ? <Home cards={cards} favorites={favorites} expiring={expiring} onCreate={beginCreate} onSelect={setSelected} onOpenShowcase={() => setShowcaseOpen(true)} onShowAll={() => setTab('cards')} /> : null}
     {tab === 'cards' ? <Collection cards={visibleCards} query={query} setQuery={setQuery} filter={filter} setFilter={setFilter} onCreate={beginCreate} onSelect={setSelected} /> : null}
     {tab === 'settings' ? <Settings cards={cards} update={update} onCheckUpdate={checkForUpdate} onOpenUpdate={openUpdate} onReset={() => Alert.alert('恢复示例数据？', '这会用示例卡片覆盖当前所有数据。', [{ text: '取消', style: 'cancel' }, { text: '恢复', style: 'destructive', onPress: () => setCards(SEED_CARDS) }])} /> : null}
     <BottomNav active={tab} onChange={setTab} />
+    <FanDeck key={showcaseOpen ? 'open' : 'closed'} open={showcaseOpen} cards={cards} onClose={() => setShowcaseOpen(false)} onSelect={(card) => { setShowcaseOpen(false); setSelected(card); }} />
     <CardDetail card={selected} onClose={() => setSelected(null)} onEdit={beginEdit} onFavorite={toggleFavorite} onDelete={deleteCard} />
     <Editor open={editorOpen} draft={draft} setDraft={setDraft} onClose={() => setEditorOpen(false)} onSave={saveCard} onPickImage={pickImage} />
   </SafeAreaView>;
 }
 
-function Home({ cards, favorites, expiring, onCreate, onSelect, onShowAll }) {
+function Home({ cards, favorites, expiring, onCreate, onSelect, onOpenShowcase, onShowAll }) {
   return <ScrollView style={styles.screen} contentContainerStyle={styles.screenContent} showsVerticalScrollIndicator={false}>
     <View style={styles.homeHeader}><View><Text style={styles.eyebrow}>CARD CABINET · 01</Text><Text style={styles.pageTitle}>我的卡匣</Text></View><Pressable accessibilityLabel="新增卡片" style={styles.addRound} onPress={onCreate}><Ionicons name="add" size={28} color="#fff" /></Pressable></View>
     <View style={styles.archiveHero}><View style={styles.heroTop}><Text style={styles.heroKicker}>PRIVATE ARCHIVE</Text><View style={styles.localPill}><Ionicons name="phone-portrait-outline" size={12} color="#E5D2AD" /><Text style={styles.localPillText}>仅存本机</Text></View></View><Text style={styles.heroTitle}>把每一张重要的{`\n`}卡，留在触手可及处。</Text><View style={styles.heroFoot}><View style={styles.heroMark}><Ionicons name="albums-outline" size={18} color="#182B25" /></View><Text style={styles.heroFootText}>{cards.length ? `已悉心收录 ${cards.length} 张实体卡` : '从第一张实体卡开始建立档案'}</Text></View></View>
     <View style={styles.overview}><Stat icon="albums" label="已收录" value={`${cards.length} 张`} tone="#B57251" /><View style={styles.statDivider} /><Stat icon="heart" label="常用" value={`${favorites.length} 张`} tone="#B94E5B" /><View style={styles.statDivider} /><Stat icon="time" label="近期到期" value={`${expiring} 张`} tone="#B38C47" /></View>
-    <CardShowcase cards={cards} onSelect={onSelect} onCreate={onCreate} />
+    <CardShowcase cards={cards} onOpen={onOpenShowcase} onCreate={onCreate} />
     <View style={styles.sectionHead}><View><Text style={styles.sectionTitle}>常用卡片</Text><Text style={styles.sectionHint}>快速找到你最常用的那几张</Text></View><Pressable onPress={onShowAll}><Text style={styles.textLink}>查看全部</Text></Pressable></View>
     {favorites.length ? <FlatList horizontal data={favorites} keyExtractor={(item) => item.id} showsHorizontalScrollIndicator={false} contentContainerStyle={styles.featuredList} renderItem={({ item }) => <Pressable accessibilityLabel={`查看 ${item.name}`} onPress={() => onSelect(item)} style={styles.featuredItem}><CardVisual card={item} /><Text numberOfLines={1} style={styles.featuredName}>{item.name}</Text><Text numberOfLines={1} style={styles.featuredMeta}>{categoryFor(item.category).name} · {item.issuer}</Text></Pressable>} /> : <EmptyCompact onCreate={onCreate} />}
     <View style={styles.sectionHead}><View><Text style={styles.sectionTitle}>最近收录</Text><Text style={styles.sectionHint}>按加入时间排序</Text></View></View>
@@ -258,4 +269,26 @@ const showcaseStyles = StyleSheet.create({
   showcaseEmpty: { minHeight: 96, marginHorizontal: 22, marginBottom: 30, borderRadius: 20, paddingHorizontal: 17, backgroundColor: '#132F28', flexDirection: 'row', alignItems: 'center', gap: 13 },
   showcaseEmptyTitle: { fontSize: 15, fontWeight: '700', color: '#FCFAF4' },
   showcaseEmptyHint: { fontSize: 12, color: 'rgba(252,250,244,.68)', marginTop: 3 },
+});
+
+const fanStyles = StyleSheet.create({
+  safe: { flex: 1, backgroundColor: '#102B24', paddingTop: Platform.OS === 'android' ? 24 : 0 },
+  header: { height: 76, paddingHorizontal: 22, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  closeButton: { width: 48, height: 48, borderRadius: 24, backgroundColor: 'rgba(255,255,255,.11)', alignItems: 'center', justifyContent: 'center' },
+  kicker: { fontSize: 9, letterSpacing: 1.5, fontWeight: '700', color: '#C8AC7E', textAlign: 'center' },
+  title: { fontSize: 18, fontWeight: '700', color: '#F9F7F0', marginTop: 3, textAlign: 'center' },
+  counter: { minWidth: 48, fontSize: 13, fontWeight: '700', color: '#DCC89E', textAlign: 'right' },
+  hint: { color: 'rgba(249,247,240,.64)', textAlign: 'center', fontSize: 12, marginTop: 10 },
+  stage: { height: 380, marginTop: 26, position: 'relative', alignItems: 'center', justifyContent: 'center' },
+  cardTouch: { position: 'absolute', width: 240, height: 154, left: '50%', marginLeft: -120 },
+  card: { width: 240, height: 154, borderRadius: 20, shadowColor: '#000', shadowOpacity: 0.32, shadowOffset: { width: 0, height: 9 }, shadowRadius: 15, elevation: 9 },
+  footer: { marginTop: 'auto', paddingHorizontal: 22, paddingBottom: 28 },
+  pager: { minHeight: 64, flexDirection: 'row', alignItems: 'center', gap: 12, marginBottom: 16 },
+  arrowButton: { width: 48, height: 48, borderRadius: 24, backgroundColor: 'rgba(255,255,255,.12)', alignItems: 'center', justifyContent: 'center' },
+  arrowDisabled: { opacity: 0.28 },
+  caption: { flex: 1, minWidth: 0, alignItems: 'center' },
+  cardName: { maxWidth: '100%', fontSize: 16, fontWeight: '700', color: '#F9F7F0' },
+  cardMeta: { maxWidth: '100%', fontSize: 12, color: 'rgba(249,247,240,.62)', marginTop: 3 },
+  detailButton: { height: 52, borderRadius: 16, backgroundColor: '#E5CCA1', flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8 },
+  detailButtonText: { fontSize: 15, fontWeight: '700', color: '#142E27' },
 });
