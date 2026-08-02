@@ -1,6 +1,8 @@
 node_modules/
 .expo/
 dist/
+.expo-export-test/
+.build-cache/
 *.jks
 *.keystore
 emulator-*.png
@@ -15,3 +17,4 @@ brand-*.png
 copy-*.png
 image-preview-*.png
 privacy-*.png
+migration-*.png

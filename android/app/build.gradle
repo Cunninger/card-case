@@ -71,9 +71,12 @@ def releaseStorePassword = System.getenv('CARD_CASE_RELEASE_STORE_PASSWORD')
 def releaseKeyAlias = System.getenv('CARD_CASE_RELEASE_KEY_ALIAS')
 def releaseKeyPassword = System.getenv('CARD_CASE_RELEASE_KEY_PASSWORD')
 def hasReleaseSigning = [releaseStoreFilePath, releaseStorePassword, releaseKeyAlias, releaseKeyPassword].every { it?.trim() }
+// Used once to ship an in-place migration build to users of the historical
+// debug-signed APK. New releases must keep this unset and use the release key.
+def useLegacyDebugSigning = System.getenv('CARD_CASE_USE_LEGACY_DEBUG_SIGNING')?.toBoolean() ?: false
 def isReleaseTask = gradle.startParameter.taskNames.any { it.toLowerCase().contains('release') }
 
-if (isReleaseTask && !hasReleaseSigning) {
+if (isReleaseTask && !hasReleaseSigning && !useLegacyDebugSigning) {
     throw new GradleException('Release signing is required. Set CARD_CASE_RELEASE_STORE_FILE, CARD_CASE_RELEASE_STORE_PASSWORD, CARD_CASE_RELEASE_KEY_ALIAS, and CARD_CASE_RELEASE_KEY_PASSWORD before building a release APK.')
 }
 
@@ -125,7 +128,11 @@ android {
             signingConfig signingConfigs.debug
         }
         release {
-            if (hasReleaseSigning) signingConfig signingConfigs.release
+            if (useLegacyDebugSigning) {
+                signingConfig signingConfigs.debug
+            } else if (hasReleaseSigning) {
+                signingConfig signingConfigs.release
+            }
             shrinkResources (findProperty('android.enableShrinkResourcesInReleaseBuilds')?.toBoolean() ?: false)
             minifyEnabled enableProguardInReleaseBuilds
             proguardFiles getDefaultProguardFile("proguard-android.txt"), "proguard-rules.pro"

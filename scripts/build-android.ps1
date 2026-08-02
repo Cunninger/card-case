@@ -11,10 +11,15 @@ $gradle = Join-Path $projectRoot 'android\gradlew.bat'
 if (-not (Test-Path $sdkRoot)) { throw "Android SDK not found: $sdkRoot. Install it with Android Studio first." }
 if (-not (Get-Command java -ErrorAction SilentlyContinue)) { throw 'Java not found. Install JDK 17 or newer and reopen the terminal.' }
 if ($Variant -eq 'release') {
-  $requiredSigningVariables = @('CARD_CASE_RELEASE_STORE_FILE', 'CARD_CASE_RELEASE_STORE_PASSWORD', 'CARD_CASE_RELEASE_KEY_ALIAS', 'CARD_CASE_RELEASE_KEY_PASSWORD')
-  $missingSigningVariables = $requiredSigningVariables | Where-Object { [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_)) }
-  if ($missingSigningVariables) { throw "Release signing is not configured. Set: $($missingSigningVariables -join ', ')" }
-  if (-not (Test-Path $env:CARD_CASE_RELEASE_STORE_FILE)) { throw "Release keystore not found: $env:CARD_CASE_RELEASE_STORE_FILE" }
+  $legacyMigrationBuild = $env:CARD_CASE_USE_LEGACY_DEBUG_SIGNING -eq 'true'
+  if (-not $legacyMigrationBuild) {
+    $requiredSigningVariables = @('CARD_CASE_RELEASE_STORE_FILE', 'CARD_CASE_RELEASE_STORE_PASSWORD', 'CARD_CASE_RELEASE_KEY_ALIAS', 'CARD_CASE_RELEASE_KEY_PASSWORD')
+    $missingSigningVariables = $requiredSigningVariables | Where-Object { [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_)) }
+    if ($missingSigningVariables) { throw "Release signing is not configured. Set: $($missingSigningVariables -join ', ')" }
+    if (-not (Test-Path $env:CARD_CASE_RELEASE_STORE_FILE)) { throw "Release keystore not found: $env:CARD_CASE_RELEASE_STORE_FILE" }
+  } else {
+    Write-Warning 'Building a legacy migration APK with the historical debug signature. Do not use this setting for future releases.'
+  }
 }
 
 $env:ANDROID_HOME = $sdkRoot

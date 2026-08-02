@@ -35,6 +35,18 @@ npm run apk
 
 Release APK 默认启用 R8 压缩并拒绝调试签名。如需上架 Google Play，请使用同一套受保护的发布密钥执行 `bundleRelease` 生成 AAB。
 
+### 从旧调试签名迁移
+
+旧版调试签名 APK 无法直接覆盖为正式签名 APK。迁移版会在“设置 → 加密迁移”中提供备份工具：创建一个 `.cardcase` 加密备份（包含卡片资料与正反面照片），记住你设置的密码；再卸载旧版、安装正式签名版，并在同一入口导入该文件。备份密码不会存储在设备或文件中，遗失后无法恢复。
+
+仅为这一次兼容旧版的迁移 Release，可以显式设置下列环境变量，以历史调试签名构建；此方式绝不可用于迁移完成后的新版本：
+
+```powershell
+$env:CARD_CASE_USE_LEGACY_DEBUG_SIGNING = 'true'
+npm run apk
+Remove-Item Env:CARD_CASE_USE_LEGACY_DEBUG_SIGNING
+```
+
 ## GitHub 检查更新
 
 应用会检查仓库 `Cunninger/card-case` 的最新 GitHub Release。发布新版本时：
@@ -48,3 +60,5 @@ Release APK 默认启用 R8 压缩并拒绝调试签名。如需上架 Google Pl
 ## 隐私说明
 
 卡片文本和照片 URI 仅保存在设备本地；应用不连接任何服务器。Android 正式包会使用系统 Android KeyStore 加密卡片文本、卡号、备注和隐私偏好，并在首次启动时迁移旧版明文资料。照片文件仍保存在应用私有沙盒中；详情页和照片预览可隐藏卡号中段，取消编辑、删除、替换照片或恢复示例数据时会清理不再关联的照片。卡片内容会在写入本机存储成功后才更新界面。Android 版本还会禁止系统备份、截图及任务切换预览，以减少实体卡照片外泄风险。请勿在“备注”中保存完整密码、CVV 或其他高敏感认证信息。
+
+导出的 `.cardcase` 文件会以用户设置的密码通过 PBKDF2-HMAC-SHA256 派生密钥，再使用 AES-256-CBC 加密，并附带 HMAC-SHA256 完整性校验；它包含卡片文本及已保存的正反面照片。备份密码不会保存或上传，务必单独保管。
