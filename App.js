@@ -17,6 +17,7 @@ import {
   FlatList,
   Image,
   Modal,
+  NativeModules,
   Platform,
   Pressable,
   SafeAreaView,
@@ -30,9 +31,11 @@ import {
 const STORAGE_KEY = '@card-cabinet/cards-v1';
 const LOCK_ENABLED_KEY = '@card-cabinet/privacy-lock-v1';
 const NUMBER_MASK_ENABLED_KEY = '@card-cabinet/mask-card-number-v1';
-const APP_VERSION = '1.3.0';
+const NATIVE_SECURE_STORAGE = Platform.OS === 'android' ? NativeModules.CardCaseSecureStorage : null;
+const APP_VERSION = '1.4.0';
 const RELEASES_API = 'https://api.github.com/repos/Cunninger/card-case/releases/latest';
 const RELEASE_ASSET_MIRROR = 'https://gh-proxy.com/';
+const CARD_PHOTO_DIRECTORY = `${FileSystem.documentDirectory}card-photos/`;
 const BRAND_LOGO = require('./assets/card-case-logo.png');
 const BRAND = {
   ink: '#18382F',
@@ -81,6 +84,37 @@ const compareVersions = (left, right) => {
     if (delta) return Math.sign(delta);
   }
   return 0;
+};
+const getStoredValue = async (key) => {
+  if (!NATIVE_SECURE_STORAGE) return AsyncStorage.getItem(key);
+  const encryptedValue = await NATIVE_SECURE_STORAGE.getItem(key);
+  if (encryptedValue !== null) return encryptedValue;
+  const legacyValue = await AsyncStorage.getItem(key);
+  if (legacyValue === null) return null;
+  await NATIVE_SECURE_STORAGE.setItem(key, legacyValue);
+  await AsyncStorage.removeItem(key);
+  return legacyValue;
+};
+const setStoredValue = (key, value) => NATIVE_SECURE_STORAGE
+  ? NATIVE_SECURE_STORAGE.setItem(key, value)
+  : AsyncStorage.setItem(key, value);
+const managedPhotoUrisFor = (card) => [...new Set([
+  card?.frontImage || card?.image,
+  card?.backImage,
+].filter((uri) => typeof uri === 'string' && uri.startsWith(CARD_PHOTO_DIRECTORY)))];
+const cleanUpOrphanedPhotos = async (candidateUris, remainingCards, protectedUris = []) => {
+  const referencedUris = new Set([...remainingCards.flatMap(managedPhotoUrisFor), ...protectedUris]);
+  const orphanedUris = [...new Set(candidateUris)].filter((uri) => !referencedUris.has(uri));
+  const results = await Promise.all(orphanedUris.map(async (uri) => {
+    try {
+      const info = await FileSystem.getInfoAsync(uri);
+      if (info.exists) await FileSystem.deleteAsync(uri, { idempotent: true });
+      return true;
+    } catch {
+      return false;
+    }
+  }));
+  return results.every(Boolean);
 };
 
 const haptic = (kind = 'selection') => {
@@ -195,6 +229,7 @@ export default function App() {
   const [iconsReady] = useFonts(Ionicons.font);
   const [cards, setCards] = useState([]);
   const [ready, setReady] = useState(false);
+  const [storageLoadError, setStorageLoadError] = useState(false);
   const [tab, setTab] = useState('home');
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState('all');
@@ -210,18 +245,37 @@ export default function App() {
   const [appIsActive, setAppIsActive] = useState(AppState.currentState === 'active');
   const authInFlight = useRef(false);
   const appState = useRef(AppState.currentState);
+  const cardsRef = useRef([]);
+  const draftRef = useRef(emptyDraft());
 
   useEffect(() => {
-    Promise.all([AsyncStorage.getItem(STORAGE_KEY), AsyncStorage.getItem(LOCK_ENABLED_KEY), AsyncStorage.getItem(NUMBER_MASK_ENABLED_KEY)]).then(([raw, lockPreference, numberMaskPreference]) => {
-      if (raw) setCards(JSON.parse(raw).map((card) => ({ ...card, frontImage: card.frontImage || card.image || null, backImage: card.backImage || null }))); else setCards(SEED_CARDS);
+    Promise.all([getStoredValue(STORAGE_KEY), getStoredValue(LOCK_ENABLED_KEY), getStoredValue(NUMBER_MASK_ENABLED_KEY)]).then(([raw, lockPreference, numberMaskPreference]) => {
+      const initialCards = raw
+        ? JSON.parse(raw).map((card) => ({ ...card, frontImage: card.frontImage || card.image || null, backImage: card.backImage || null }))
+        : SEED_CARDS;
+      cardsRef.current = initialCards;
+      setCards(initialCards);
       const shouldLock = lockPreference === 'true';
       setAppLockEnabled(shouldLock);
       setLocked(shouldLock);
       setMaskCardNumberEnabled(numberMaskPreference !== 'false');
-    }).catch(() => setCards(SEED_CARDS)).finally(() => setReady(true));
+    }).catch(() => { cardsRef.current = []; setCards([]); setStorageLoadError(true); }).finally(() => setReady(true));
   }, []);
 
-  useEffect(() => { if (ready) AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(cards)); }, [cards, ready]);
+  useEffect(() => { cardsRef.current = cards; }, [cards]);
+  useEffect(() => { draftRef.current = draft; }, [draft]);
+
+  const commitCards = async (nextCards) => {
+    try {
+      await setStoredValue(STORAGE_KEY, JSON.stringify(nextCards));
+      cardsRef.current = nextCards;
+      setCards(nextCards);
+      return true;
+    } catch {
+      Alert.alert('保存失败', '无法把本次修改写入设备本地存储，卡片资料未发生变更。请检查设备存储空间后重试。');
+      return false;
+    }
+  };
 
   const unlock = useCallback(async () => {
     if (!appLockEnabled || authInFlight.current) return;
@@ -264,7 +318,7 @@ export default function App() {
 
   const toggleAppLock = async () => {
     if (appLockEnabled) {
-      await AsyncStorage.setItem(LOCK_ENABLED_KEY, 'false');
+      await setStoredValue(LOCK_ENABLED_KEY, 'false');
       setAppLockEnabled(false);
       setLocked(false);
       haptic();
@@ -275,7 +329,7 @@ export default function App() {
       Alert.alert('暂时无法启用', '请先在系统设置中添加指纹或人脸信息，再开启应用锁。');
       return;
     }
-    await AsyncStorage.setItem(LOCK_ENABLED_KEY, 'true');
+    await setStoredValue(LOCK_ENABLED_KEY, 'true');
     setAppLockEnabled(true);
     setLocked(true);
     haptic('success');
@@ -286,24 +340,58 @@ export default function App() {
     setMaskCardNumberEnabled(nextValue);
     haptic();
     try {
-      await AsyncStorage.setItem(NUMBER_MASK_ENABLED_KEY, String(nextValue));
+      await setStoredValue(NUMBER_MASK_ENABLED_KEY, String(nextValue));
     } catch {
       setMaskCardNumberEnabled(!nextValue);
       Alert.alert('保存失败', '无法保存隐私显示偏好，请稍后再试。');
     }
   };
 
-  const beginCreate = () => { haptic('impact'); setDraft(emptyDraft()); setEditorOpen(true); };
-  const beginEdit = (card) => { setDraft({ ...card }); setSelected(null); setEditorOpen(true); };
-  const saveCard = () => {
+  const beginCreate = () => { const nextDraft = emptyDraft(); haptic('impact'); draftRef.current = nextDraft; setDraft(nextDraft); setEditorOpen(true); };
+  const beginEdit = (card) => { const nextDraft = { ...card }; draftRef.current = nextDraft; setDraft(nextDraft); setSelected(null); setEditorOpen(true); };
+  const saveCard = async () => {
     if (!draft.name.trim()) { Alert.alert('还差一步', '请给这张卡片填写一个名称。'); return; }
     const item = { ...draft, name: draft.name.trim(), id: draft.id || `card-${Date.now()}`, createdAt: draft.createdAt || Date.now() };
-    setCards((old) => draft.id ? old.map((card) => card.id === draft.id ? item : card) : [item, ...old]);
+    const currentCards = cardsRef.current;
+    const previousCard = draft.id ? currentCards.find((card) => card.id === draft.id) : null;
+    const nextCards = draft.id ? currentCards.map((card) => card.id === draft.id ? item : card) : [item, ...currentCards];
+    const saved = await commitCards(nextCards);
+    if (!saved) return;
     haptic('success');
     setEditorOpen(false);
+    if (previousCard) {
+      const photosCleaned = await cleanUpOrphanedPhotos(managedPhotoUrisFor(previousCard), nextCards);
+      if (!photosCleaned) Alert.alert('卡片已保存', '原实体卡照片未能完全清理，请稍后重试或检查设备存储。');
+    }
   };
-  const toggleFavorite = (id) => setCards((old) => old.map((card) => card.id === id ? { ...card, favorite: !card.favorite } : card));
-  const deleteCard = (card) => Alert.alert('删除这张卡？', '删除后无法恢复。', [{ text: '取消', style: 'cancel' }, { text: '删除', style: 'destructive', onPress: () => { setCards((old) => old.filter((item) => item.id !== card.id)); setSelected(null); } }]);
+  const toggleFavorite = async (id) => {
+    const nextCards = cardsRef.current.map((card) => card.id === id ? { ...card, favorite: !card.favorite } : card);
+    if (await commitCards(nextCards)) haptic();
+  };
+  const deleteCard = (card) => Alert.alert('删除这张卡？', '这会移除卡片资料和本地实体照片，无法恢复。', [{ text: '取消', style: 'cancel' }, { text: '删除', style: 'destructive', onPress: async () => {
+    const nextCards = cardsRef.current.filter((item) => item.id !== card.id);
+    const saved = await commitCards(nextCards);
+    if (!saved) return;
+    setSelected(null);
+    const photosCleaned = await cleanUpOrphanedPhotos(managedPhotoUrisFor(card), nextCards);
+    if (!photosCleaned) Alert.alert('卡片已删除', '部分本地实体照片未能清理，请稍后重试或检查设备存储。');
+  } }]);
+  const resetCards = () => Alert.alert('恢复示例数据？', '这会用示例卡片覆盖当前资料，并移除这些卡片使用的本地实体照片，无法恢复。', [{ text: '取消', style: 'cancel' }, { text: '恢复', style: 'destructive', onPress: async () => {
+    const previousCards = cardsRef.current;
+    const saved = await commitCards(SEED_CARDS);
+    if (!saved) return;
+    const photosCleaned = await cleanUpOrphanedPhotos(previousCards.flatMap(managedPhotoUrisFor), SEED_CARDS);
+    if (!photosCleaned) Alert.alert('已恢复示例数据', '部分本地实体照片未能清理，请稍后重试或检查设备存储。');
+  } }]);
+  const closeEditor = async () => {
+    const abandonedDraft = draftRef.current;
+    const cleared = await cleanUpOrphanedPhotos(managedPhotoUrisFor(abandonedDraft), cardsRef.current);
+    const nextDraft = emptyDraft();
+    draftRef.current = nextDraft;
+    setDraft(nextDraft);
+    setEditorOpen(false);
+    if (!cleared) Alert.alert('已取消编辑', '未保存的实体卡照片未能完全清理，请稍后重试或检查设备存储。');
+  };
   const pickImage = async (side) => {
     const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
     if (!permission.granted) { Alert.alert('需要相册权限', '请允许访问照片，才能为卡片添加实物照片。'); return; }
@@ -315,11 +403,18 @@ export default function App() {
       // from referring to a file Android has already cleaned up.
       const sourceUri = result.assets[0].uri;
       const sourceExtension = sourceUri.split('?')[0].match(/\.([a-zA-Z0-9]+)$/)?.[1] || 'jpg';
-      const cardPhotoDirectory = `${FileSystem.documentDirectory}card-photos`;
-      await FileSystem.makeDirectoryAsync(cardPhotoDirectory, { intermediates: true });
-      const persistentUri = `${cardPhotoDirectory}/card-${Date.now()}.${sourceExtension}`;
+      await FileSystem.makeDirectoryAsync(CARD_PHOTO_DIRECTORY, { intermediates: true });
+      const persistentUri = `${CARD_PHOTO_DIRECTORY}card-${Date.now()}.${sourceExtension}`;
       await FileSystem.copyAsync({ from: sourceUri, to: persistentUri });
-      setDraft((old) => ({ ...old, [side]: persistentUri }));
+      const currentDraft = draftRef.current;
+      const previousPhoto = currentDraft[side];
+      const nextDraft = { ...currentDraft, [side]: persistentUri };
+      draftRef.current = nextDraft;
+      setDraft(nextDraft);
+      if (previousPhoto && previousPhoto !== persistentUri) {
+        const photosCleaned = await cleanUpOrphanedPhotos([previousPhoto], cardsRef.current, managedPhotoUrisFor(nextDraft));
+        if (!photosCleaned) Alert.alert('照片已更换', '旧实体卡照片未能完全清理，请稍后重试或检查设备存储。');
+      }
     } catch {
       Alert.alert('照片保存失败', '这张图片没有成功复制到本地，请重新选择一次。');
     }
@@ -352,17 +447,22 @@ export default function App() {
   const openUpdate = () => { if (update.downloadUrl) Linking.openURL(update.downloadUrl); };
 
   if (!ready || !iconsReady) return <SafeAreaView style={styles.loading}><Text style={styles.loadingText}>正在打开你的卡匣…</Text></SafeAreaView>;
+  if (storageLoadError) return <StorageRecovery />;
   if (locked) return <AppLock onUnlock={unlock} unlocking={unlocking} />;
 
   return <SafeAreaView style={styles.safe}><StatusBar style="dark" backgroundColor="#F6F6F1" />
     {tab === 'home' ? <Home cards={cards} favorites={favorites} expiring={expiring} onCreate={beginCreate} onSelect={setSelected} onOpenShowcase={() => setShowcaseOpen(true)} onShowAll={() => setTab('cards')} /> : null}
     {tab === 'cards' ? <Collection cards={visibleCards} query={query} setQuery={setQuery} filter={filter} setFilter={setFilter} onCreate={beginCreate} onSelect={setSelected} /> : null}
-    {tab === 'settings' ? <Settings cards={cards} update={update} lockEnabled={appLockEnabled} onToggleLock={toggleAppLock} onCheckUpdate={checkForUpdate} onOpenUpdate={openUpdate} onReset={() => Alert.alert('恢复示例数据？', '这会用示例卡片覆盖当前所有数据。', [{ text: '取消', style: 'cancel' }, { text: '恢复', style: 'destructive', onPress: () => setCards(SEED_CARDS) }])} /> : null}
+    {tab === 'settings' ? <Settings cards={cards} update={update} lockEnabled={appLockEnabled} onToggleLock={toggleAppLock} onCheckUpdate={checkForUpdate} onOpenUpdate={openUpdate} onReset={resetCards} /> : null}
     <BottomNav active={tab} onChange={setTab} />
     <FanDeck key={showcaseOpen ? 'open' : 'closed'} open={showcaseOpen} cards={cards} onClose={() => setShowcaseOpen(false)} onSelect={(card) => { setShowcaseOpen(false); setSelected(card); }} />
     <CardDetail card={selected} maskNumber={maskCardNumberEnabled} onToggleNumberMask={toggleNumberMask} onClose={() => setSelected(null)} onEdit={beginEdit} onFavorite={toggleFavorite} onDelete={deleteCard} />
-    <Editor open={editorOpen} draft={draft} setDraft={setDraft} onClose={() => setEditorOpen(false)} onSave={saveCard} onPickImage={pickImage} />
+    <Editor open={editorOpen} draft={draft} setDraft={setDraft} onClose={closeEditor} onSave={saveCard} onPickImage={pickImage} />
   </SafeAreaView>;
+}
+
+function StorageRecovery() {
+  return <SafeAreaView style={recoveryStyles.screen}><StatusBar style="dark" backgroundColor="#F6F6F1" /><View style={recoveryStyles.content}><BrandSignature /><View style={recoveryStyles.icon}><Ionicons name="shield-outline" size={31} color={BRAND.gold} /></View><Text style={recoveryStyles.title}>无法打开加密档案</Text><Text style={recoveryStyles.body}>为避免覆盖你已有的卡片资料，卡匣已停止写入本机数据。请不要卸载应用或清除数据；确认设备安全设置正常后重新打开应用。</Text><View style={recoveryStyles.notice}><Ionicons name="information-circle-outline" size={18} color={BRAND.taupe} /><Text style={recoveryStyles.noticeText}>若问题持续，请保留当前设备并联系支持人员处理。</Text></View></View></SafeAreaView>;
 }
 
 function Home({ cards, favorites, expiring, onCreate, onSelect, onOpenShowcase, onShowAll }) {
@@ -421,7 +521,7 @@ function CardDetail({ card, maskNumber, onToggleNumberMask, onClose, onEdit, onF
     <View style={styles.detailArchiveHeader}><BrandSignature compact /><View style={styles.detailArchiveMeta}><View style={[styles.categoryDot, { backgroundColor: category.tone }]} /><Text style={styles.detailArchiveMetaText}>{category.name} · 实体档案</Text></View></View>
     <View style={styles.detailPrivacyNotice}><Ionicons name={maskNumber ? 'eye-off-outline' : 'eye-outline'} size={16} color={BRAND.taupe} /><Text style={styles.detailPrivacyNoticeText}>{maskNumber ? '隐私显示已开启：照片与卡号中段已隐藏' : '完整卡号正在显示：请在安全环境中查看'}</Text></View>
     <Text style={styles.photoSectionLabel}>卡片正面</Text><Pressable accessibilityLabel={frontImage ? '放大查看卡片正面' : '卡片正面未上传照片'} disabled={!frontImage} onPress={() => setPreview({ uri: frontImage, label: '卡片正面' })} style={previewStyles.trigger}><CardVisual card={card} maskNumber={maskNumber} />{frontImage ? <View pointerEvents="none" style={previewStyles.badge}><Ionicons name="expand-outline" size={15} color="#FFFDF7" /><Text style={previewStyles.badgeText}>原件预览</Text></View> : null}</Pressable>
-    {card.backImage ? <View style={styles.backPhotoBlock}><Text style={styles.photoSectionLabel}>卡片反面</Text><Pressable accessibilityLabel="放大查看卡片反面" onPress={() => setPreview({ uri: card.backImage, label: '卡片反面' })} style={previewStyles.trigger}><SensitivePhoto uri={card.backImage} label="卡片反面" masked={maskNumber} style={styles.backCardImage} /> <View pointerEvents="none" style={previewStyles.badge}><Ionicons name="expand-outline" size={15} color="#FFFDF7" /><Text style={previewStyles.badgeText}>原件预览</Text></View></Pressable></View> : <View style={styles.backPhotoMissing}><Ionicons name="copy-outline" size={18} color={BRAND.gold} /><Text style={styles.backPhotoMissingText}>尚未收录卡片反面</Text></View>}
+    {card.backImage ? <View style={styles.backPhotoBlock}><Text style={styles.photoSectionLabel}>卡片反面</Text><Pressable accessibilityLabel="放大查看卡片反面" onPress={() => setPreview({ uri: card.backImage, label: '卡片反面' })} style={previewStyles.trigger}><SensitivePhoto uri={card.backImage} label="卡片反面" masked={maskNumber} style={styles.backCardImage} /><View pointerEvents="none" style={previewStyles.badge}><Ionicons name="expand-outline" size={15} color="#FFFDF7" /><Text style={previewStyles.badgeText}>原件预览</Text></View></Pressable></View> : <View style={styles.backPhotoMissing}><Ionicons name="copy-outline" size={18} color={BRAND.gold} /><Text style={styles.backPhotoMissingText}>尚未收录卡片反面</Text></View>}
     <Text style={styles.detailName}>{card.name}</Text><Text style={styles.detailIssuer}>{card.issuer || category.name}</Text><View style={styles.detailInfo}><InfoLine icon="business-outline" label="发卡机构" value={card.issuer || '未设置'} copyable={Boolean(card.issuer)} /><InfoLine icon="albums-outline" label="类别" value={category.name} copyable /><InfoLine icon="calendar-outline" label="有效期" value={card.expiry || '未设置'} copyable={Boolean(card.expiry)} /><InfoLine icon="card-outline" label="卡号 / 编号" value={card.number || '未设置'} displayValue={maskNumber ? maskCardNumber(card.number || '未设置') : (card.number || '未设置')} copyable={Boolean(card.number)} />{card.note ? <InfoLine icon="document-text-outline" label="备注" value={card.note} multiline copyable /> : null}</View><Pressable onPress={() => { haptic('impact'); onDelete(card); }} style={styles.deleteButton}><Ionicons name="trash-outline" size={18} color="#B54A52" /><Text style={styles.deleteText}>删除此卡片</Text></Pressable>
   </ScrollView><ImagePreview preview={preview} masked={maskNumber} onToggleMask={onToggleNumberMask} onClose={() => setPreview(null)} /></View></Modal>;
 }
@@ -473,6 +573,16 @@ const styles = StyleSheet.create({
   settingsCard:{overflow:'hidden',borderRadius:18,borderWidth:1,borderColor:'#E9E4DA',backgroundColor:BRAND.paper,shadowColor:'#41382D',shadowOpacity:.05,shadowOffset:{width:0,height:4},shadowRadius:10,elevation:1},settingRowPressed:{opacity:.68},aboutCard:{padding:16,gap:5},aboutText:{fontSize:12,color:'#777A73',marginLeft:43},lockSettingIcon:{backgroundColor:'#F2E7D5'},lockSwitch:{width:44,height:26,borderRadius:13,padding:3,backgroundColor:'#BEC2B9',justifyContent:'center'},lockSwitchOn:{backgroundColor:BRAND.ink},lockSwitchThumb:{width:20,height:20,borderRadius:10,backgroundColor:'#FFFDF8'},lockSwitchThumbOn:{alignSelf:'flex-end'},
   infoValueWrap:{flex:1,flexDirection:'row',alignItems:'center',justifyContent:'flex-end',gap:8,minWidth:0},infoValueWrapMulti:{alignItems:'flex-start'},infoValueCopy:{flex:0,flexShrink:1},copyButton:{height:36,minWidth:56,paddingHorizontal:9,borderRadius:11,backgroundColor:'#F3EEE4',borderWidth:1,borderColor:'#E4D7C4',flexDirection:'row',alignItems:'center',justifyContent:'center',gap:4},copyButtonDone:{backgroundColor:BRAND.ink,borderColor:BRAND.ink},copyButtonPressed:{opacity:.68,transform:[{scale:.96}]},copyButtonText:{fontSize:11,fontWeight:'700',color:BRAND.taupe},copyButtonTextDone:{color:'#FFFDF8'},
   safe:{flex:1,backgroundColor:'#F6F6F1',paddingTop:Platform.OS==='android'?24:0},loading:{flex:1,justifyContent:'center',alignItems:'center',backgroundColor:'#F6F6F1',paddingTop:Platform.OS==='android'?24:0},loadingText:{color:'#565C55',fontSize:16},screen:{flex:1},screenContent:{paddingTop:20,paddingBottom:98},homeHeader:{paddingHorizontal:22,flexDirection:'row',justifyContent:'space-between',alignItems:'flex-start'},eyebrow:{fontSize:10,letterSpacing:1.8,color:'#8A6B48',fontWeight:'700',marginBottom:6},pageTitle:{fontSize:31,lineHeight:39,color:'#182B25',fontWeight:'700',letterSpacing:-1},pageSubtitle:{fontSize:14,lineHeight:22,color:'#70756D',marginTop:5},addRound:{width:48,height:48,borderRadius:16,backgroundColor:'#182B25',alignItems:'center',justifyContent:'center',shadowColor:'#182B25',shadowOpacity:.18,shadowRadius:10,elevation:4},archiveHero:{marginHorizontal:22,marginTop:22,marginBottom:24,borderRadius:22,padding:20,backgroundColor:'#182B25',minHeight:174,justifyContent:'space-between',shadowColor:'#102019',shadowOpacity:.2,shadowRadius:16,elevation:5},heroTop:{flexDirection:'row',alignItems:'center',justifyContent:'space-between'},heroKicker:{fontSize:10,letterSpacing:1.7,fontWeight:'700',color:'#C8AC7E'},localPill:{flexDirection:'row',alignItems:'center',gap:5,borderWidth:1,borderColor:'rgba(229,210,173,.28)',borderRadius:14,paddingHorizontal:8,paddingVertical:5},localPillText:{fontSize:10,color:'#E5D2AD',fontWeight:'600'},heroTitle:{fontSize:22,lineHeight:30,letterSpacing:-.5,color:'#FCFAF4',fontWeight:'600'},heroFoot:{flexDirection:'row',alignItems:'center',gap:9},heroMark:{width:30,height:30,borderRadius:15,backgroundColor:'#D9BD8B',alignItems:'center',justifyContent:'center'},heroFootText:{fontSize:12,color:'rgba(252,250,244,.74)'},overview:{marginHorizontal:22,marginBottom:30,paddingVertical:16,backgroundColor:'#FEFEFA',borderRadius:18,flexDirection:'row',justifyContent:'space-around',borderWidth:1,borderColor:'#E9E8DF'},stat:{flex:1,flexDirection:'row',alignItems:'center',justifyContent:'center',gap:8},statIcon:{width:30,height:30,borderRadius:10,alignItems:'center',justifyContent:'center'},statValue:{fontSize:15,fontWeight:'700',color:'#182B25'},statLabel:{fontSize:11,color:'#858880',marginTop:1},statDivider:{height:31,width:1,backgroundColor:'#E5E4DC'},sectionHead:{marginHorizontal:22,marginBottom:13,flexDirection:'row',alignItems:'flex-end',justifyContent:'space-between'},sectionTitle:{fontSize:19,fontWeight:'700',color:'#182B25'},sectionHint:{fontSize:12,color:'#858880',marginTop:3},textLink:{fontSize:13,color:'#8A6241',fontWeight:'600',padding:7},featuredList:{paddingLeft:22,paddingRight:8,gap:14,paddingBottom:30},featuredItem:{width:230},featuredName:{fontSize:15,fontWeight:'700',color:'#182B25',marginTop:11},featuredMeta:{fontSize:12,color:'#82857E',marginTop:4},cardVisual:{height:144,borderRadius:17,overflow:'hidden',padding:16,justifyContent:'space-between',shadowColor:'#34312C',shadowOpacity:.18,shadowOffset:{width:0,height:5},shadowRadius:12,elevation:5},cardVisualCompact:{width:104,height:70,borderRadius:11,padding:9,shadowOpacity:.1,elevation:2},cardImage:{...StyleSheet.absoluteFillObject,width:'100%',height:'100%',resizeMode:'cover'},cardShade:{...StyleSheet.absoluteFillObject,backgroundColor:'rgba(15,19,17,.18)'},cardPhotoPrivacyMask:{position:'absolute',left:'7%',right:'7%',top:'50%',height:'25%',borderRadius:10,backgroundColor:'rgba(9,27,22,.88)',borderWidth:1,borderColor:'rgba(246,229,196,.32)',flexDirection:'row',alignItems:'center',justifyContent:'center',gap:5},cardPhotoPrivacyMaskText:{fontSize:10,fontWeight:'700',color:'#F6E5C4'},cardTop:{flexDirection:'row',justifyContent:'space-between',alignItems:'center'},cardIssuer:{color:'#fff',fontSize:12,fontWeight:'600',maxWidth:'80%'},cardBottom:{gap:5},cardNumber:{color:'#fff',fontSize:17,letterSpacing:1.6,fontWeight:'500'},cardNumberCompact:{fontSize:10,letterSpacing:.8},cardNameOnCard:{color:'rgba(255,255,255,.88)',fontSize:12,fontWeight:'500'},emptyCompact:{height:108,borderRadius:16,borderWidth:1,borderStyle:'dashed',borderColor:'#D4C2AA',marginHorizontal:22,marginBottom:30,alignItems:'center',justifyContent:'center',gap:8},emptyCompactText:{fontSize:13,color:'#817565'},cardRow:{flexDirection:'row',alignItems:'center',gap:13,paddingVertical:11,paddingHorizontal:22,backgroundColor:'#F6F6F1'},pressed:{opacity:.68},rowInfo:{flex:1,minWidth:0},rowTitleLine:{flexDirection:'row',alignItems:'center',gap:6},rowName:{fontSize:16,fontWeight:'650',color:'#182B25',flexShrink:1},rowIssuer:{fontSize:13,color:'#7E8279',marginTop:3},rowFoot:{flexDirection:'row',alignItems:'center',marginTop:7,gap:5},categoryDot:{width:6,height:6,borderRadius:3},rowCategory:{fontSize:11,color:'#777B73'},rowExpiry:{fontSize:11,color:'#94968F',marginLeft:5},collectionTop:{paddingTop:18,paddingHorizontal:22,paddingBottom:16},searchBox:{height:47,backgroundColor:'#ECEDE7',borderRadius:14,marginTop:20,paddingHorizontal:14,flexDirection:'row',alignItems:'center',gap:9},searchInput:{flex:1,fontSize:15,color:'#182B25',height:'100%'},filterWrap:{height:47,borderBottomWidth:1,borderBottomColor:'#E6E5DE'},filterList:{paddingHorizontal:22,gap:8,alignItems:'center'},filter:{height:31,paddingHorizontal:13,borderRadius:16,backgroundColor:'#E9E9E3',justifyContent:'center'},filterActive:{backgroundColor:'#182B25'},filterText:{fontSize:13,color:'#686C65'},filterTextActive:{color:'#fff',fontWeight:'600'},collectionList:{paddingBottom:98},emptyState:{alignItems:'center',paddingTop:80,paddingHorizontal:38},emptyIcon:{width:64,height:64,borderRadius:22,backgroundColor:'#EEE6D9',alignItems:'center',justifyContent:'center'},emptyTitle:{fontSize:17,fontWeight:'700',color:'#182B25',marginTop:16},emptyBody:{fontSize:13,color:'#858880',textAlign:'center',lineHeight:20,marginTop:7},emptyButton:{marginTop:20,backgroundColor:'#182B25',borderRadius:12,paddingHorizontal:18,paddingVertical:11},emptyButtonText:{color:'#fff',fontWeight:'600'},bottomNav:{position:'absolute',bottom:0,left:0,right:0,height:72,paddingHorizontal:20,paddingBottom:Platform.OS==='android'?6:0,backgroundColor:'rgba(254,254,250,.98)',borderTopWidth:1,borderTopColor:'#E5E3DC',flexDirection:'row',alignItems:'center',justifyContent:'space-around'},navItem:{flex:1,height:54,alignItems:'center',justifyContent:'center',gap:3},navText:{fontSize:10,color:'#7A7E76'},navTextActive:{color:'#182B25',fontWeight:'700'},modalShell:{flex:1,justifyContent:'flex-end'},backdrop:{...StyleSheet.absoluteFillObject,backgroundColor:'rgba(22,26,23,.46)'},detailSheet:{backgroundColor:'#FAFAF6',borderTopLeftRadius:28,borderTopRightRadius:28,maxHeight:'90%'},detailSheetContent:{paddingHorizontal:22,paddingBottom:34},sheetHandle:{height:4,width:38,borderRadius:2,backgroundColor:'#C7C9C1',alignSelf:'center',marginTop:10},detailActions:{height:62,flexDirection:'row',justifyContent:'space-between',alignItems:'center'},detailActionRight:{flexDirection:'row',gap:8},iconButton:{height:44,width:44,borderRadius:22,alignItems:'center',justifyContent:'center',backgroundColor:'#EFF0EB'},iconButtonPressed:{opacity:.66,transform:[{scale:.95}]},privacyIconButton:{backgroundColor:'#F0E5D2',borderWidth:1,borderColor:'#E2CBA8'},detailPrivacyNotice:{minHeight:38,marginBottom:16,paddingHorizontal:11,borderRadius:11,backgroundColor:'#F1E9DE',flexDirection:'row',alignItems:'center',gap:7},detailPrivacyNoticeText:{fontSize:11,fontWeight:'600',color:'#6C5B4B',flex:1},photoSectionLabel:{fontSize:12,fontWeight:'700',letterSpacing:.7,color:'#8A6B48',marginBottom:9},backPhotoBlock:{marginTop:20},backCardImage:{width:'100%',height:180,borderRadius:16,backgroundColor:'#E8E8E2'},detailName:{fontSize:25,fontWeight:'700',color:'#182B25',marginTop:20},detailIssuer:{fontSize:14,color:'#7E827A',marginTop:4},detailInfo:{marginTop:23,borderTopWidth:1,borderTopColor:'#E5E5DE'},infoLine:{minHeight:55,borderBottomWidth:1,borderBottomColor:'#E5E5DE',flexDirection:'row',alignItems:'center',justifyContent:'space-between',gap:14},infoLineTop:{paddingVertical:14,alignItems:'flex-start'},infoLabel:{flexDirection:'row',alignItems:'center',gap:8,minWidth:95},infoLabelText:{fontSize:13,color:'#72766E'},infoValue:{fontSize:14,color:'#182B25',fontWeight:'500',flex:1,textAlign:'right'},infoValueMulti:{lineHeight:20,fontWeight:'400'},deleteButton:{marginTop:22,height:48,borderRadius:13,borderWidth:1,borderColor:'#E8C6C7',alignItems:'center',justifyContent:'center',flexDirection:'row',gap:8},deleteText:{fontSize:14,fontWeight:'600',color:'#B54A52'},editorSafe:{flex:1,backgroundColor:'#F7F7F2'},editorHead:{height:58,paddingHorizontal:17,flexDirection:'row',alignItems:'center',justifyContent:'space-between',backgroundColor:'#FCFCF8',borderBottomWidth:1,borderBottomColor:'#E8E7E0'},editorTitle:{fontSize:16,fontWeight:'700',color:'#182B25'},editorCancel:{minWidth:45,paddingVertical:10},editorCancelText:{color:'#6D716A',fontSize:15},editorSave:{backgroundColor:'#182B25',borderRadius:9,paddingHorizontal:13,paddingVertical:7},editorSaveText:{color:'#fff',fontSize:14,fontWeight:'700'},editorContent:{padding:20,paddingBottom:45},photoHelper:{fontSize:12,color:'#7E817A',lineHeight:18,marginTop:-1,marginBottom:13},photoPicker:{position:'relative',marginBottom:14},photoHint:{position:'absolute',bottom:10,alignSelf:'center',backgroundColor:'rgba(255,253,247,.9)',borderRadius:18,paddingHorizontal:12,paddingVertical:7,flexDirection:'row',alignItems:'center',gap:5},photoHintText:{fontSize:12,fontWeight:'600',color:'#5C574D'},backPhotoPicker:{height:150,borderRadius:16,overflow:'hidden',backgroundColor:'#EBEAE3',marginBottom:26,position:'relative'},backPhotoPlaceholder:{flex:1,alignItems:'center',justifyContent:'center',gap:5,borderWidth:1,borderStyle:'dashed',borderColor:'#CFC3B0',borderRadius:16},backPhotoTitle:{fontSize:14,fontWeight:'700',color:'#5A5144'},backPhotoHint:{fontSize:12,color:'#82786A'},backPhotoBadge:{position:'absolute',bottom:10,alignSelf:'center',backgroundColor:'rgba(255,253,247,.92)',borderRadius:18,paddingHorizontal:12,paddingVertical:7,flexDirection:'row',alignItems:'center',gap:5},backPhotoBadgeText:{fontSize:12,fontWeight:'600',color:'#5C574D'},formSection:{fontSize:13,fontWeight:'700',letterSpacing:.6,color:'#8A6B48',marginBottom:5},field:{marginTop:16},fieldLabel:{fontSize:13,color:'#555A53',fontWeight:'600',marginBottom:8},input:{minHeight:48,borderWidth:1,borderColor:'#DEDCD4',backgroundColor:'#FCFCF8',borderRadius:12,paddingHorizontal:13,fontSize:15,color:'#182B25'},inputMulti:{height:92,paddingTop:12},categoryList:{gap:8,paddingBottom:3},categoryChoice:{height:39,borderRadius:11,borderWidth:1,borderColor:'#DFDED6',paddingHorizontal:11,flexDirection:'row',alignItems:'center',gap:6,backgroundColor:'#FCFCF8'},categoryChoiceText:{fontSize:13,fontWeight:'600',color:'#4F554E'},colorList:{flexDirection:'row',gap:13,marginBottom:4},colorDot:{width:30,height:30,borderRadius:15,alignItems:'center',justifyContent:'center'},colorDotActive:{borderWidth:2,borderColor:'#F7F7F2',shadowColor:'#333',shadowOpacity:.3,shadowRadius:3,elevation:3},favoriteToggle:{marginTop:23,padding:14,borderRadius:14,backgroundColor:'#ECEDE7',flexDirection:'row',gap:12,alignItems:'center'},switchTrack:{width:40,height:24,borderRadius:12,backgroundColor:'#B5B8B0',padding:3,justifyContent:'center'},switchTrackOn:{backgroundColor:'#8A6241'},switchThumb:{width:18,height:18,borderRadius:9,backgroundColor:'#fff'},switchThumbOn:{alignSelf:'flex-end'},favoriteLabel:{fontSize:14,fontWeight:'700',color:'#182B25'},favoriteHelp:{fontSize:12,color:'#7C8078',marginTop:2},privacyBox:{marginTop:16,flexDirection:'row',gap:9,padding:12,backgroundColor:'#F1E9DE',borderRadius:12},privacyText:{fontSize:12,color:'#716658',lineHeight:18,flex:1},settingsContent:{padding:22,paddingBottom:98},settingsGroup:{marginTop:28},settingsLabel:{fontSize:12,fontWeight:'700',letterSpacing:.6,color:'#8A6B48',marginBottom:9},settingRow:{minHeight:72,backgroundColor:'#FEFEFA',borderBottomWidth:1,borderBottomColor:'#E7E6E0',padding:13,flexDirection:'row',alignItems:'center',gap:12},settingIcon:{width:38,height:38,borderRadius:12,backgroundColor:'#E8ECE5',alignItems:'center',justifyContent:'center'},settingBody:{flex:1},settingName:{fontSize:15,fontWeight:'650',color:'#182B25'},settingHint:{fontSize:12,color:'#7E817A',marginTop:3},updateIcon:{backgroundColor:'#F1E3D0'},updateHelp:{fontSize:12,color:'#83867E',lineHeight:18,paddingHorizontal:13,paddingTop:9,backgroundColor:'#FEFEFA'},resetButton:{alignSelf:'center',marginTop:38,paddingVertical:9,paddingHorizontal:12},resetText:{fontSize:13,color:'#A24E54'}
+});
+
+const recoveryStyles = StyleSheet.create({
+  screen: { flex: 1, backgroundColor: '#F6F6F1', paddingTop: Platform.OS === 'android' ? 24 : 0 },
+  content: { flex: 1, paddingHorizontal: 28, justifyContent: 'center' },
+  icon: { width: 68, height: 68, borderRadius: 24, alignItems: 'center', justifyContent: 'center', backgroundColor: '#F1E9DE', marginBottom: 20 },
+  title: { fontSize: 26, fontWeight: '800', letterSpacing: -0.7, color: BRAND.ink },
+  body: { fontSize: 14, lineHeight: 23, color: '#62675F', marginTop: 11 },
+  notice: { marginTop: 23, padding: 13, borderRadius: 14, backgroundColor: '#FCFCF8', flexDirection: 'row', gap: 8, borderWidth: 1, borderColor: '#E4DED3' },
+  noticeText: { fontSize: 12, lineHeight: 18, color: BRAND.taupe, flex: 1 },
 });
 
 const showcaseStyles = StyleSheet.create({

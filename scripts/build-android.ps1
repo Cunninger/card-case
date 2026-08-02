@@ -10,6 +10,12 @@ $gradle = Join-Path $projectRoot 'android\gradlew.bat'
 
 if (-not (Test-Path $sdkRoot)) { throw "Android SDK not found: $sdkRoot. Install it with Android Studio first." }
 if (-not (Get-Command java -ErrorAction SilentlyContinue)) { throw 'Java not found. Install JDK 17 or newer and reopen the terminal.' }
+if ($Variant -eq 'release') {
+  $requiredSigningVariables = @('CARD_CASE_RELEASE_STORE_FILE', 'CARD_CASE_RELEASE_STORE_PASSWORD', 'CARD_CASE_RELEASE_KEY_ALIAS', 'CARD_CASE_RELEASE_KEY_PASSWORD')
+  $missingSigningVariables = $requiredSigningVariables | Where-Object { [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_)) }
+  if ($missingSigningVariables) { throw "Release signing is not configured. Set: $($missingSigningVariables -join ', ')" }
+  if (-not (Test-Path $env:CARD_CASE_RELEASE_STORE_FILE)) { throw "Release keystore not found: $env:CARD_CASE_RELEASE_STORE_FILE" }
+}
 
 $env:ANDROID_HOME = $sdkRoot
 $env:ANDROID_SDK_ROOT = $sdkRoot

@@ -20,9 +20,20 @@ npm install
 npm run apk
 ```
 
-构建成功后，直接把 `android\app\build\outputs\apk\release\app-release.apk` 传到手机安装即可。若只用于调试，可运行 `powershell -ExecutionPolicy Bypass -File .\scripts\build-android.ps1 -Variant debug`。
+Release APK 必须使用专用签名密钥。首次在 Windows PowerShell 中创建密钥并设置仅当前终端有效的环境变量：
 
-该 release APK 使用开发签名，适合个人安装和测试；如需上架 Google Play，请另行创建上传密钥并使用 `bundleRelease` 生成 AAB。
+```powershell
+keytool -genkeypair -v -keystore .\card-case-release.keystore -alias card-case -keyalg RSA -keysize 4096 -validity 10000
+$env:CARD_CASE_RELEASE_STORE_FILE = (Resolve-Path .\card-case-release.keystore).Path
+$env:CARD_CASE_RELEASE_STORE_PASSWORD = '你的密钥库密码'
+$env:CARD_CASE_RELEASE_KEY_ALIAS = 'card-case'
+$env:CARD_CASE_RELEASE_KEY_PASSWORD = '你的密钥密码'
+npm run apk
+```
+
+构建成功后，将 `android\app\build\outputs\apk\release\app-release.apk` 传到手机安装。若只用于调试，可运行 `powershell -ExecutionPolicy Bypass -File .\scripts\build-android.ps1 -Variant debug`。密钥文件和密码不得提交到 Git；请离线备份密钥，否则今后无法为同一应用包名发布更新。
+
+Release APK 默认启用 R8 压缩并拒绝调试签名。如需上架 Google Play，请使用同一套受保护的发布密钥执行 `bundleRelease` 生成 AAB。
 
 ## GitHub 检查更新
 
@@ -36,4 +47,4 @@ npm run apk
 
 ## 隐私说明
 
-卡片文本和照片 URI 仅保存在设备本地；应用不连接任何服务器。请勿在“备注”中保存完整密码、CVV 或其他高敏感认证信息。
+卡片文本和照片 URI 仅保存在设备本地；应用不连接任何服务器。Android 正式包会使用系统 Android KeyStore 加密卡片文本、卡号、备注和隐私偏好，并在首次启动时迁移旧版明文资料。照片文件仍保存在应用私有沙盒中；详情页和照片预览可隐藏卡号中段，取消编辑、删除、替换照片或恢复示例数据时会清理不再关联的照片。卡片内容会在写入本机存储成功后才更新界面。Android 版本还会禁止系统备份、截图及任务切换预览，以减少实体卡照片外泄风险。请勿在“备注”中保存完整密码、CVV 或其他高敏感认证信息。
