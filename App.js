@@ -35,7 +35,7 @@ const STORAGE_KEY = '@card-cabinet/cards-v1';
 const LOCK_ENABLED_KEY = '@card-cabinet/privacy-lock-v1';
 const NUMBER_MASK_ENABLED_KEY = '@card-cabinet/mask-card-number-v1';
 const NATIVE_SECURE_STORAGE = Platform.OS === 'android' ? NativeModules.CardCaseSecureStorage : null;
-const APP_VERSION = '1.4.0';
+const APP_VERSION = '1.5.0';
 const RELEASES_API = 'https://api.github.com/repos/Cunninger/card-case/releases/latest';
 const RELEASE_ASSET_MIRROR = 'https://gh-proxy.com/';
 const CARD_PHOTO_DIRECTORY = `${FileSystem.documentDirectory}card-photos/`;
