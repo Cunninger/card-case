@@ -34,8 +34,9 @@ import {
 const STORAGE_KEY = '@card-cabinet/cards-v1';
 const LOCK_ENABLED_KEY = '@card-cabinet/privacy-lock-v1';
 const NUMBER_MASK_ENABLED_KEY = '@card-cabinet/mask-card-number-v1';
+const BACKUP_STATUS_KEY = '@card-cabinet/backup-status-v1';
 const NATIVE_SECURE_STORAGE = Platform.OS === 'android' ? NativeModules.CardCaseSecureStorage : null;
-const APP_VERSION = '1.5.0';
+const APP_VERSION = '1.6.0';
 const RELEASES_API = 'https://api.github.com/repos/Cunninger/card-case/releases/latest';
 const RELEASE_ASSET_MIRROR = 'https://gh-proxy.com/';
 const CARD_PHOTO_DIRECTORY = `${FileSystem.documentDirectory}card-photos/`;
@@ -123,6 +124,21 @@ const cleanUpOrphanedPhotos = async (candidateUris, remainingCards, protectedUri
 const photoExtensionFor = (uri, fallback = 'jpg') => {
   const candidate = String(uri || '').split('?')[0].match(/\.([a-zA-Z0-9]{1,8})$/)?.[1]?.toLowerCase();
   return /^(jpe?g|png|webp|heic|heif)$/.test(candidate || '') ? candidate : fallback;
+};
+const backupFingerprintFor = (cards) => {
+  const snapshot = JSON.stringify(cards);
+  let hash = 2166136261;
+  for (let index = 0; index < snapshot.length; index += 1) {
+    hash ^= snapshot.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `${cards.length}-${(hash >>> 0).toString(16)}`;
+};
+const formatBackupTime = (value) => {
+  const date = new Date(value);
+  if (!value || Number.isNaN(date.getTime())) return '尚未创建备份';
+  const pad = (number) => String(number).padStart(2, '0');
+  return `${date.getFullYear()}年${pad(date.getMonth() + 1)}月${pad(date.getDate())}日 ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 };
 
 const haptic = (kind = 'selection') => {
@@ -248,6 +264,7 @@ export default function App() {
   const [update, setUpdate] = useState({ status: 'idle', message: `当前版本 ${APP_VERSION}` });
   const [appLockEnabled, setAppLockEnabled] = useState(false);
   const [maskCardNumberEnabled, setMaskCardNumberEnabled] = useState(true);
+  const [backupStatus, setBackupStatus] = useState(null);
   const [locked, setLocked] = useState(false);
   const [unlocking, setUnlocking] = useState(false);
   const [backupMode, setBackupMode] = useState(null);
@@ -260,7 +277,7 @@ export default function App() {
   const draftRef = useRef(emptyDraft());
 
   useEffect(() => {
-    Promise.all([getStoredValue(STORAGE_KEY), getStoredValue(LOCK_ENABLED_KEY), getStoredValue(NUMBER_MASK_ENABLED_KEY)]).then(([raw, lockPreference, numberMaskPreference]) => {
+    Promise.all([getStoredValue(STORAGE_KEY), getStoredValue(LOCK_ENABLED_KEY), getStoredValue(NUMBER_MASK_ENABLED_KEY), getStoredValue(BACKUP_STATUS_KEY)]).then(([raw, lockPreference, numberMaskPreference, rawBackupStatus]) => {
       const initialCards = raw
         ? JSON.parse(raw).map((card) => ({ ...card, frontImage: card.frontImage || card.image || null, backImage: card.backImage || null }))
         : SEED_CARDS;
@@ -270,11 +287,19 @@ export default function App() {
       setAppLockEnabled(shouldLock);
       setLocked(shouldLock);
       setMaskCardNumberEnabled(numberMaskPreference !== 'false');
+      try {
+        const parsedStatus = rawBackupStatus ? JSON.parse(rawBackupStatus) : null;
+        setBackupStatus(parsedStatus?.fingerprint && parsedStatus?.savedAt ? parsedStatus : null);
+      } catch {
+        setBackupStatus(null);
+      }
     }).catch(() => { cardsRef.current = []; setCards([]); setStorageLoadError(true); }).finally(() => setReady(true));
   }, []);
 
   useEffect(() => { cardsRef.current = cards; }, [cards]);
   useEffect(() => { draftRef.current = draft; }, [draft]);
+  const currentBackupFingerprint = useMemo(() => backupFingerprintFor(cards), [cards]);
+  const backupIsCurrent = Boolean(backupStatus?.fingerprint && backupStatus.fingerprint === currentBackupFingerprint);
 
   const commitCards = async (nextCards) => {
     try {
@@ -284,6 +309,16 @@ export default function App() {
       return true;
     } catch {
       Alert.alert('保存失败', '无法把本次修改写入设备本地存储，卡片资料未发生变更。请检查设备存储空间后重试。');
+      return false;
+    }
+  };
+  const markBackupCurrent = async (cardsToMark, savedAt = new Date().toISOString()) => {
+    const nextStatus = { fingerprint: backupFingerprintFor(cardsToMark), savedAt, cardCount: cardsToMark.length };
+    try {
+      await setStoredValue(BACKUP_STATUS_KEY, JSON.stringify(nextStatus));
+      setBackupStatus(nextStatus);
+      return true;
+    } catch {
       return false;
     }
   };
@@ -387,13 +422,6 @@ export default function App() {
     const photosCleaned = await cleanUpOrphanedPhotos(managedPhotoUrisFor(card), nextCards);
     if (!photosCleaned) Alert.alert('卡片已删除', '部分本地实体照片未能清理，请稍后重试或检查设备存储。');
   } }]);
-  const resetCards = () => Alert.alert('恢复示例数据？', '这会用示例卡片覆盖当前资料，并移除这些卡片使用的本地实体照片，无法恢复。', [{ text: '取消', style: 'cancel' }, { text: '恢复', style: 'destructive', onPress: async () => {
-    const previousCards = cardsRef.current;
-    const saved = await commitCards(SEED_CARDS);
-    if (!saved) return;
-    const photosCleaned = await cleanUpOrphanedPhotos(previousCards.flatMap(managedPhotoUrisFor), SEED_CARDS);
-    if (!photosCleaned) Alert.alert('已恢复示例数据', '部分本地实体照片未能清理，请稍后重试或检查设备存储。');
-  } }]);
   const closeEditor = async () => {
     const abandonedDraft = draftRef.current;
     const cleared = await cleanUpOrphanedPhotos(managedPhotoUrisFor(abandonedDraft), cardsRef.current);
@@ -470,10 +498,12 @@ export default function App() {
       temporaryUri = `${BACKUP_CACHE_DIRECTORY}card-case-${Date.now()}${BACKUP_EXTENSION}`;
       await FileSystem.writeAsStringAsync(temporaryUri, encryptedBackup, { encoding: FileSystem.EncodingType.UTF8 });
       if (!await Sharing.isAvailableAsync()) throw new Error('当前设备不支持文件分享。');
-      await Sharing.shareAsync(temporaryUri, { mimeType: 'application/octet-stream', dialogTitle: '保存卡匣加密备份' });
+      const shareResult = await Sharing.shareAsync(temporaryUri, { mimeType: 'application/octet-stream', dialogTitle: '保存卡匣加密备份' });
+      if (shareResult?.action === 'dismissedAction') return;
+      const statusRecorded = await markBackupCurrent(cardsRef.current);
       haptic('success');
       setBackupMode(null);
-      Alert.alert('加密备份已创建', `已打包 ${payload.cards.length} 张卡片和 ${payload.photos.length} 张实体卡照片。请妥善保存备份密码。`);
+      Alert.alert('加密备份已创建', `已打包 ${payload.cards.length} 张卡片和 ${payload.photos.length} 张实体卡照片。${statusRecorded ? '备份状态已更新。' : '备份状态暂未记录，请下次打开设置时确认。'}请妥善保存备份密码。`);
     } catch (error) {
       Alert.alert('备份未完成', error?.message || '无法创建加密备份，请稍后重试。');
     } finally {
@@ -520,10 +550,11 @@ export default function App() {
       }
       setSelected(null);
       const cleaned = await cleanUpOrphanedPhotos(previousCards.flatMap(managedPhotoUrisFor), restoredCards);
+      const statusRecorded = await markBackupCurrent(restoredCards);
       haptic('success');
       setBackupMode(null);
       setPendingBackup(null);
-      Alert.alert('导入完成', `已恢复 ${restoredCards.length} 张卡片${payload.photos.length ? `与 ${payload.photos.length} 张实体卡照片` : ''}。${cleaned ? '' : ' 原有照片未能完全清理，请稍后检查设备存储。'}`);
+      Alert.alert('导入完成', `已恢复 ${restoredCards.length} 张卡片${payload.photos.length ? `与 ${payload.photos.length} 张实体卡照片` : ''}。${statusRecorded ? '备份状态已同步。' : ' 备份状态暂未同步。'}${cleaned ? '' : ' 原有照片未能完全清理，请稍后检查设备存储。'}`);
     } catch (error) {
       await cleanUpOrphanedPhotos(stagedUris, previousCards);
       Alert.alert('导入未完成', error?.message || '备份资料未写入本机，请重新选择文件后再试。');
@@ -580,7 +611,7 @@ export default function App() {
   return <SafeAreaView style={styles.safe}><StatusBar style="dark" backgroundColor="#F6F6F1" />
     {tab === 'home' ? <Home cards={cards} favorites={favorites} expiring={expiring} onCreate={beginCreate} onSelect={setSelected} onOpenShowcase={() => setShowcaseOpen(true)} onShowAll={() => setTab('cards')} /> : null}
     {tab === 'cards' ? <Collection cards={visibleCards} query={query} setQuery={setQuery} filter={filter} setFilter={setFilter} onCreate={beginCreate} onSelect={setSelected} /> : null}
-    {tab === 'settings' ? <Settings cards={cards} update={update} lockEnabled={appLockEnabled} onToggleLock={toggleAppLock} onCheckUpdate={checkForUpdate} onOpenUpdate={openUpdate} onExportBackup={() => setBackupMode('export')} onImportBackup={chooseBackupToImport} onReset={resetCards} /> : null}
+    {tab === 'settings' ? <Settings cards={cards} update={update} lockEnabled={appLockEnabled} backupStatus={backupStatus} backupIsCurrent={backupIsCurrent} onToggleLock={toggleAppLock} onCheckUpdate={checkForUpdate} onOpenUpdate={openUpdate} onExportBackup={() => setBackupMode('export')} onImportBackup={chooseBackupToImport} /> : null}
     <BottomNav active={tab} onChange={setTab} />
     <FanDeck key={showcaseOpen ? 'open' : 'closed'} open={showcaseOpen} cards={cards} onClose={() => setShowcaseOpen(false)} onSelect={(card) => { setShowcaseOpen(false); setSelected(card); }} />
     <CardDetail card={selected} maskNumber={maskCardNumberEnabled} onToggleNumberMask={toggleNumberMask} onClose={() => setSelected(null)} onEdit={beginEdit} onFavorite={toggleFavorite} onDelete={deleteCard} />
@@ -712,14 +743,31 @@ function BackupDialog({ mode, backupName, busy, onClose, onExport, onImport }) {
   </Modal>;
 }
 
-function Settings({ cards, update, lockEnabled, onToggleLock, onCheckUpdate, onOpenUpdate, onExportBackup, onImportBackup, onReset }) {
+function BackupStatusPanel({ cards, backupStatus, backupIsCurrent, onExportBackup }) {
+  const backedUpAt = backupStatus?.savedAt ? formatBackupTime(backupStatus.savedAt) : '尚未创建备份';
+  const title = backupIsCurrent ? '你的卡片档案已备份' : '建议立即更新加密备份';
+  const detail = backupIsCurrent
+    ? `${cards.length} 张卡片与已关联照片均有可恢复副本`
+    : backupStatus?.savedAt
+      ? '卡片资料在上次备份后有变化'
+      : '创建第一份加密备份，为资料留一份副本';
+  return <Pressable accessibilityRole="button" accessibilityLabel={title} accessibilityHint="打开加密备份创建流程" onPress={() => { haptic('impact'); onExportBackup(); }} style={({ pressed }) => [styles.backupStatusPanel, backupIsCurrent ? styles.backupStatusCurrent : styles.backupStatusAttention, pressed && styles.backupStatusPressed]}>
+    <View pointerEvents="none" style={styles.backupStatusHalo} />
+    <View style={styles.backupStatusHead}><View style={styles.backupStatusEyebrow}><Ionicons name={backupIsCurrent ? 'checkmark-circle' : 'shield-outline'} size={14} color={backupIsCurrent ? '#BFE4D0' : '#F4D9A6'} /><Text style={styles.backupStatusEyebrowText}>{backupIsCurrent ? 'DATA PROTECTED' : 'BACKUP RECOMMENDED'}</Text></View><View style={[styles.backupStatusPill, backupIsCurrent ? styles.backupStatusPillCurrent : styles.backupStatusPillAttention]}><Text style={styles.backupStatusPillText}>{backupIsCurrent ? '已同步' : '待更新'}</Text></View></View>
+    <Text style={styles.backupStatusTitle}>{title}</Text><Text style={styles.backupStatusDetail}>{detail}</Text>
+    <View style={styles.backupStatusFoot}><View><Text style={styles.backupStatusTimeLabel}>最近一次备份</Text><Text style={styles.backupStatusTime}>{backedUpAt}</Text></View><View style={styles.backupStatusAction}><Text style={styles.backupStatusActionText}>{backupIsCurrent ? '新建备份' : '立即备份'}</Text><Ionicons name="arrow-forward" size={17} color={BRAND.inkDeep} /></View></View>
+  </Pressable>;
+}
+
+function Settings({ cards, update, lockEnabled, backupStatus, backupIsCurrent, onToggleLock, onCheckUpdate, onOpenUpdate, onExportBackup, onImportBackup }) {
   const updateAvailable = update.status === 'available';
   return <ScrollView style={styles.screen} contentContainerStyle={styles.settingsContent} showsVerticalScrollIndicator={false}>
     <BrandSignature /><Text style={styles.pageTitle}>设置</Text><Text style={styles.pageSubtitle}>管理你的卡片资料与本地数据。</Text>
+    <BackupStatusPanel cards={cards} backupStatus={backupStatus} backupIsCurrent={backupIsCurrent} onExportBackup={onExportBackup} />
     <View style={styles.settingsGroup}><Text style={styles.settingsLabel}>数据与隐私</Text><View style={styles.settingsCard}><View style={styles.settingRow}><View style={styles.settingIcon}><Ionicons name="phone-portrait-outline" size={20} color="#5A635B" /></View><View style={styles.settingBody}><Text style={styles.settingName}>本地存储</Text><Text style={styles.settingHint}>当前设备已保存 {cards.length} 张卡片</Text></View><Ionicons name="checkmark-circle" size={21} color="#4E896B" /></View><View style={styles.settingRow}><View style={styles.settingIcon}><Ionicons name="shield-checkmark-outline" size={20} color="#5A635B" /></View><View style={styles.settingBody}><Text style={styles.settingName}>隐私提醒</Text><Text style={styles.settingHint}>请不要保存密码、CVV 等认证信息</Text></View></View><Pressable accessibilityRole="switch" accessibilityState={{ checked: lockEnabled }} accessibilityLabel="应用锁" accessibilityHint="启用后需要设备验证才能查看卡片" onPress={onToggleLock} style={({ pressed }) => [styles.settingRow, pressed && styles.settingRowPressed]}><View style={[styles.settingIcon, lockEnabled && styles.lockSettingIcon]}><Ionicons name={lockEnabled ? 'lock-closed' : 'lock-open-outline'} size={20} color={lockEnabled ? BRAND.gold : '#5A635B'} /></View><View style={styles.settingBody}><Text style={styles.settingName}>应用锁</Text><Text style={styles.settingHint}>{lockEnabled ? '已启用：返回应用时需要验证' : '启用设备指纹或人脸验证'}</Text></View><View pointerEvents="none" style={[styles.lockSwitch, lockEnabled && styles.lockSwitchOn]}><View style={[styles.lockSwitchThumb, lockEnabled && styles.lockSwitchThumbOn]} /></View></Pressable></View></View>
-    <View style={styles.settingsGroup}><Text style={styles.settingsLabel}>加密迁移</Text><View style={styles.settingsCard}><Pressable accessibilityLabel="创建加密备份" accessibilityHint="导出包含卡片正反面照片的加密备份" onPress={() => { haptic(); onExportBackup(); }} style={({ pressed }) => [styles.settingRow, pressed && styles.settingRowPressed]}><View style={[styles.settingIcon, styles.backupSettingIcon]}><Ionicons name="shield-checkmark-outline" size={20} color="#7D5C2E" /></View><View style={styles.settingBody}><Text style={styles.settingName}>创建加密备份</Text><Text style={styles.settingHint}>卡片资料与正反面照片一并加密</Text></View><Ionicons name="chevron-forward" size={21} color="#A9ACA5" /></Pressable><Pressable accessibilityLabel="导入加密备份" accessibilityHint="从卡匣加密备份恢复卡片资料" onPress={() => { haptic(); onImportBackup(); }} style={({ pressed }) => [styles.settingRow, pressed && styles.settingRowPressed]}><View style={[styles.settingIcon, styles.importSettingIcon]}><Ionicons name="arrow-down-circle-outline" size={20} color="#376D62" /></View><View style={styles.settingBody}><Text style={styles.settingName}>导入加密备份</Text><Text style={styles.settingHint}>验证密码后可恢复已导出的档案</Text></View><Ionicons name="chevron-forward" size={21} color="#A9ACA5" /></Pressable><Text style={styles.backupHelp}>迁移到正式签名版前，请先创建加密备份并记住密码。</Text></View></View>
+    <View style={styles.settingsGroup}><Text style={styles.settingsLabel}>加密备份与恢复</Text><View style={styles.settingsCard}><Pressable accessibilityLabel="创建加密备份" accessibilityHint="导出包含卡片正反面照片的加密备份" onPress={() => { haptic(); onExportBackup(); }} style={({ pressed }) => [styles.settingRow, pressed && styles.settingRowPressed]}><View style={[styles.settingIcon, styles.backupSettingIcon]}><Ionicons name="shield-checkmark-outline" size={20} color="#7D5C2E" /></View><View style={styles.settingBody}><Text style={styles.settingName}>创建加密备份</Text><Text style={styles.settingHint}>卡片资料与正反面照片一并加密</Text></View><Ionicons name="chevron-forward" size={21} color="#A9ACA5" /></Pressable><Pressable accessibilityLabel="导入加密备份" accessibilityHint="从卡匣加密备份恢复卡片资料" onPress={() => { haptic(); onImportBackup(); }} style={({ pressed }) => [styles.settingRow, pressed && styles.settingRowPressed]}><View style={[styles.settingIcon, styles.importSettingIcon]}><Ionicons name="arrow-down-circle-outline" size={20} color="#376D62" /></View><View style={styles.settingBody}><Text style={styles.settingName}>导入加密备份</Text><Text style={styles.settingHint}>验证密码后可恢复已导出的档案</Text></View><Ionicons name="chevron-forward" size={21} color="#A9ACA5" /></Pressable><Text style={styles.backupHelp}>备份密码不会保存到设备或云端；请将文件与密码分开妥善保管。</Text></View></View>
     <View style={styles.settingsGroup}><Text style={styles.settingsLabel}>应用更新</Text><View style={styles.settingsCard}><Pressable accessibilityLabel="检查应用更新" onPress={() => { haptic(); (updateAvailable ? onOpenUpdate : onCheckUpdate)(); }} style={({ pressed }) => [styles.settingRow, pressed && styles.settingRowPressed]}><View style={[styles.settingIcon, updateAvailable && styles.updateIcon]}><Ionicons name={updateAvailable ? 'arrow-down-circle-outline' : 'cloud-download-outline'} size={20} color={updateAvailable ? '#8D5B38' : '#5A635B'} /></View><View style={styles.settingBody}><Text style={styles.settingName}>{updateAvailable ? `下载新版本 ${update.version}` : '检查更新'}</Text><Text style={styles.settingHint}>{update.message}</Text></View>{update.status === 'checking' ? <Ionicons name="sync" size={20} color="#8A6B48" /> : <Ionicons name={updateAvailable ? 'arrow-forward-circle' : 'chevron-forward'} size={21} color={updateAvailable ? '#A36C49' : '#A9ACA5'} />}</Pressable><Text style={styles.updateHelp}>版本信息来自 GitHub；APK 通过国内下载镜像获取。</Text></View></View>
-    <View style={styles.settingsGroup}><Text style={styles.settingsLabel}>关于</Text><View style={[styles.settingsCard, styles.aboutCard]}><BrandSignature compact /><Text style={styles.aboutText}>版本 {APP_VERSION} · 离线实体卡管理</Text></View></View><Pressable onPress={() => { haptic('impact'); onReset(); }} style={styles.resetButton}><Text style={styles.resetText}>恢复示例数据</Text></Pressable>
+    <View style={styles.settingsGroup}><Text style={styles.settingsLabel}>关于</Text><View style={[styles.settingsCard, styles.aboutCard]}><BrandSignature compact /><Text style={styles.aboutText}>版本 {APP_VERSION} · 离线实体卡管理</Text></View></View>
   </ScrollView>;
 }
 
@@ -731,6 +779,7 @@ const styles = StyleSheet.create({
   detailArchiveHeader:{marginBottom:18,paddingBottom:15,borderBottomWidth:1,borderBottomColor:'#E8E2D8',flexDirection:'row',alignItems:'center',justifyContent:'space-between'},detailArchiveMeta:{flexDirection:'row',alignItems:'center',gap:6,paddingHorizontal:9,paddingVertical:6,borderRadius:12,backgroundColor:'#F3EEE4'},detailArchiveMetaText:{fontSize:10,fontWeight:'700',color:BRAND.taupe},backPhotoMissing:{marginTop:18,height:54,borderRadius:14,backgroundColor:'#F4EFE6',flexDirection:'row',alignItems:'center',justifyContent:'center',gap:8,borderWidth:1,borderColor:'#E6D9C5',borderStyle:'dashed'},backPhotoMissingText:{fontSize:12,color:BRAND.taupe,fontWeight:'600'},
   settingsCard:{overflow:'hidden',borderRadius:18,borderWidth:1,borderColor:'#E9E4DA',backgroundColor:BRAND.paper,shadowColor:'#41382D',shadowOpacity:.05,shadowOffset:{width:0,height:4},shadowRadius:10,elevation:1},settingRowPressed:{opacity:.68},aboutCard:{padding:16,gap:5},aboutText:{fontSize:12,color:'#777A73',marginLeft:43},lockSettingIcon:{backgroundColor:'#F2E7D5'},lockSwitch:{width:44,height:26,borderRadius:13,padding:3,backgroundColor:'#BEC2B9',justifyContent:'center'},lockSwitchOn:{backgroundColor:BRAND.ink},lockSwitchThumb:{width:20,height:20,borderRadius:10,backgroundColor:'#FFFDF8'},lockSwitchThumbOn:{alignSelf:'flex-end'},
   backupSettingIcon:{backgroundColor:'#F3E8D4'},importSettingIcon:{backgroundColor:'#E2EEE8'},backupHelp:{fontSize:12,color:'#7A766E',lineHeight:18,paddingHorizontal:13,paddingTop:10,backgroundColor:'#FEFEFA'},
+  backupStatusPanel:{marginTop:23,borderRadius:23,padding:18,overflow:'hidden',shadowColor:'#102019',shadowOpacity:.18,shadowOffset:{width:0,height:8},shadowRadius:16,elevation:6},backupStatusCurrent:{backgroundColor:'#173A31'},backupStatusAttention:{backgroundColor:'#403326'},backupStatusPressed:{opacity:.92,transform:[{scale:.985}]},backupStatusHalo:{position:'absolute',width:190,height:190,borderRadius:95,right:-58,top:-79,backgroundColor:'rgba(238,208,151,.13)'},backupStatusHead:{flexDirection:'row',alignItems:'center',justifyContent:'space-between'},backupStatusEyebrow:{flexDirection:'row',alignItems:'center',gap:5},backupStatusEyebrowText:{fontSize:10,letterSpacing:1.15,fontWeight:'800',color:'rgba(255,249,235,.76)'},backupStatusPill:{paddingHorizontal:9,paddingVertical:5,borderRadius:12,borderWidth:1},backupStatusPillCurrent:{backgroundColor:'rgba(74,151,111,.25)',borderColor:'rgba(191,228,208,.28)'},backupStatusPillAttention:{backgroundColor:'rgba(223,176,94,.15)',borderColor:'rgba(244,217,166,.26)'},backupStatusPillText:{fontSize:10,fontWeight:'800',color:'#FFF4DC'},backupStatusTitle:{fontSize:20,lineHeight:27,fontWeight:'800',letterSpacing:-.35,color:'#FFFDF7',marginTop:19},backupStatusDetail:{fontSize:12,lineHeight:19,color:'rgba(255,253,247,.68)',marginTop:4,maxWidth:'82%'},backupStatusFoot:{paddingTop:15,marginTop:16,borderTopWidth:1,borderTopColor:'rgba(255,255,255,.13)',flexDirection:'row',alignItems:'center',justifyContent:'space-between'},backupStatusTimeLabel:{fontSize:10,color:'rgba(255,253,247,.5)',fontWeight:'600'},backupStatusTime:{fontSize:11,color:'#F5E7CA',fontWeight:'700',marginTop:3},backupStatusAction:{height:38,paddingHorizontal:12,borderRadius:12,backgroundColor:'#E5CCA1',flexDirection:'row',alignItems:'center',gap:5},backupStatusActionText:{fontSize:12,fontWeight:'800',color:BRAND.inkDeep},
   infoValueWrap:{flex:1,flexDirection:'row',alignItems:'center',justifyContent:'flex-end',gap:8,minWidth:0},infoValueWrapMulti:{alignItems:'flex-start'},infoValueCopy:{flex:0,flexShrink:1},copyButton:{height:36,minWidth:56,paddingHorizontal:9,borderRadius:11,backgroundColor:'#F3EEE4',borderWidth:1,borderColor:'#E4D7C4',flexDirection:'row',alignItems:'center',justifyContent:'center',gap:4},copyButtonDone:{backgroundColor:BRAND.ink,borderColor:BRAND.ink},copyButtonPressed:{opacity:.68,transform:[{scale:.96}]},copyButtonText:{fontSize:11,fontWeight:'700',color:BRAND.taupe},copyButtonTextDone:{color:'#FFFDF8'},
   safe:{flex:1,backgroundColor:'#F6F6F1',paddingTop:Platform.OS==='android'?24:0},loading:{flex:1,justifyContent:'center',alignItems:'center',backgroundColor:'#F6F6F1',paddingTop:Platform.OS==='android'?24:0},loadingText:{color:'#565C55',fontSize:16},screen:{flex:1},screenContent:{paddingTop:20,paddingBottom:98},homeHeader:{paddingHorizontal:22,flexDirection:'row',justifyContent:'space-between',alignItems:'flex-start'},eyebrow:{fontSize:10,letterSpacing:1.8,color:'#8A6B48',fontWeight:'700',marginBottom:6},pageTitle:{fontSize:31,lineHeight:39,color:'#182B25',fontWeight:'700',letterSpacing:-1},pageSubtitle:{fontSize:14,lineHeight:22,color:'#70756D',marginTop:5},addRound:{width:48,height:48,borderRadius:16,backgroundColor:'#182B25',alignItems:'center',justifyContent:'center',shadowColor:'#182B25',shadowOpacity:.18,shadowRadius:10,elevation:4},archiveHero:{marginHorizontal:22,marginTop:22,marginBottom:24,borderRadius:22,padding:20,backgroundColor:'#182B25',minHeight:174,justifyContent:'space-between',shadowColor:'#102019',shadowOpacity:.2,shadowRadius:16,elevation:5},heroTop:{flexDirection:'row',alignItems:'center',justifyContent:'space-between'},heroKicker:{fontSize:10,letterSpacing:1.7,fontWeight:'700',color:'#C8AC7E'},localPill:{flexDirection:'row',alignItems:'center',gap:5,borderWidth:1,borderColor:'rgba(229,210,173,.28)',borderRadius:14,paddingHorizontal:8,paddingVertical:5},localPillText:{fontSize:10,color:'#E5D2AD',fontWeight:'600'},heroTitle:{fontSize:22,lineHeight:30,letterSpacing:-.5,color:'#FCFAF4',fontWeight:'600'},heroFoot:{flexDirection:'row',alignItems:'center',gap:9},heroMark:{width:30,height:30,borderRadius:15,backgroundColor:'#D9BD8B',alignItems:'center',justifyContent:'center'},heroFootText:{fontSize:12,color:'rgba(252,250,244,.74)'},overview:{marginHorizontal:22,marginBottom:30,paddingVertical:16,backgroundColor:'#FEFEFA',borderRadius:18,flexDirection:'row',justifyContent:'space-around',borderWidth:1,borderColor:'#E9E8DF'},stat:{flex:1,flexDirection:'row',alignItems:'center',justifyContent:'center',gap:8},statIcon:{width:30,height:30,borderRadius:10,alignItems:'center',justifyContent:'center'},statValue:{fontSize:15,fontWeight:'700',color:'#182B25'},statLabel:{fontSize:11,color:'#858880',marginTop:1},statDivider:{height:31,width:1,backgroundColor:'#E5E4DC'},sectionHead:{marginHorizontal:22,marginBottom:13,flexDirection:'row',alignItems:'flex-end',justifyContent:'space-between'},sectionTitle:{fontSize:19,fontWeight:'700',color:'#182B25'},sectionHint:{fontSize:12,color:'#858880',marginTop:3},textLink:{fontSize:13,color:'#8A6241',fontWeight:'600',padding:7},featuredList:{paddingLeft:22,paddingRight:8,gap:14,paddingBottom:30},featuredItem:{width:230},featuredName:{fontSize:15,fontWeight:'700',color:'#182B25',marginTop:11},featuredMeta:{fontSize:12,color:'#82857E',marginTop:4},cardVisual:{height:144,borderRadius:17,overflow:'hidden',padding:16,justifyContent:'space-between',shadowColor:'#34312C',shadowOpacity:.18,shadowOffset:{width:0,height:5},shadowRadius:12,elevation:5},cardVisualCompact:{width:104,height:70,borderRadius:11,padding:9,shadowOpacity:.1,elevation:2},cardImage:{...StyleSheet.absoluteFillObject,width:'100%',height:'100%',resizeMode:'cover'},cardShade:{...StyleSheet.absoluteFillObject,backgroundColor:'rgba(15,19,17,.18)'},cardPhotoPrivacyMask:{position:'absolute',left:'7%',right:'7%',top:'50%',height:'25%',borderRadius:10,backgroundColor:'rgba(9,27,22,.88)',borderWidth:1,borderColor:'rgba(246,229,196,.32)',flexDirection:'row',alignItems:'center',justifyContent:'center',gap:5},cardPhotoPrivacyMaskText:{fontSize:10,fontWeight:'700',color:'#F6E5C4'},cardTop:{flexDirection:'row',justifyContent:'space-between',alignItems:'center'},cardIssuer:{color:'#fff',fontSize:12,fontWeight:'600',maxWidth:'80%'},cardBottom:{gap:5},cardNumber:{color:'#fff',fontSize:17,letterSpacing:1.6,fontWeight:'500'},cardNumberCompact:{fontSize:10,letterSpacing:.8},cardNameOnCard:{color:'rgba(255,255,255,.88)',fontSize:12,fontWeight:'500'},emptyCompact:{height:108,borderRadius:16,borderWidth:1,borderStyle:'dashed',borderColor:'#D4C2AA',marginHorizontal:22,marginBottom:30,alignItems:'center',justifyContent:'center',gap:8},emptyCompactText:{fontSize:13,color:'#817565'},cardRow:{flexDirection:'row',alignItems:'center',gap:13,paddingVertical:11,paddingHorizontal:22,backgroundColor:'#F6F6F1'},pressed:{opacity:.68},rowInfo:{flex:1,minWidth:0},rowTitleLine:{flexDirection:'row',alignItems:'center',gap:6},rowName:{fontSize:16,fontWeight:'650',color:'#182B25',flexShrink:1},rowIssuer:{fontSize:13,color:'#7E8279',marginTop:3},rowFoot:{flexDirection:'row',alignItems:'center',marginTop:7,gap:5},categoryDot:{width:6,height:6,borderRadius:3},rowCategory:{fontSize:11,color:'#777B73'},rowExpiry:{fontSize:11,color:'#94968F',marginLeft:5},collectionTop:{paddingTop:18,paddingHorizontal:22,paddingBottom:16},searchBox:{height:47,backgroundColor:'#ECEDE7',borderRadius:14,marginTop:20,paddingHorizontal:14,flexDirection:'row',alignItems:'center',gap:9},searchInput:{flex:1,fontSize:15,color:'#182B25',height:'100%'},filterWrap:{height:47,borderBottomWidth:1,borderBottomColor:'#E6E5DE'},filterList:{paddingHorizontal:22,gap:8,alignItems:'center'},filter:{height:31,paddingHorizontal:13,borderRadius:16,backgroundColor:'#E9E9E3',justifyContent:'center'},filterActive:{backgroundColor:'#182B25'},filterText:{fontSize:13,color:'#686C65'},filterTextActive:{color:'#fff',fontWeight:'600'},collectionList:{paddingBottom:98},emptyState:{alignItems:'center',paddingTop:80,paddingHorizontal:38},emptyIcon:{width:64,height:64,borderRadius:22,backgroundColor:'#EEE6D9',alignItems:'center',justifyContent:'center'},emptyTitle:{fontSize:17,fontWeight:'700',color:'#182B25',marginTop:16},emptyBody:{fontSize:13,color:'#858880',textAlign:'center',lineHeight:20,marginTop:7},emptyButton:{marginTop:20,backgroundColor:'#182B25',borderRadius:12,paddingHorizontal:18,paddingVertical:11},emptyButtonText:{color:'#fff',fontWeight:'600'},bottomNav:{position:'absolute',bottom:0,left:0,right:0,height:72,paddingHorizontal:20,paddingBottom:Platform.OS==='android'?6:0,backgroundColor:'rgba(254,254,250,.98)',borderTopWidth:1,borderTopColor:'#E5E3DC',flexDirection:'row',alignItems:'center',justifyContent:'space-around'},navItem:{flex:1,height:54,alignItems:'center',justifyContent:'center',gap:3},navText:{fontSize:10,color:'#7A7E76'},navTextActive:{color:'#182B25',fontWeight:'700'},modalShell:{flex:1,justifyContent:'flex-end'},backdrop:{...StyleSheet.absoluteFillObject,backgroundColor:'rgba(22,26,23,.46)'},detailSheet:{backgroundColor:'#FAFAF6',borderTopLeftRadius:28,borderTopRightRadius:28,maxHeight:'90%'},detailSheetContent:{paddingHorizontal:22,paddingBottom:34},sheetHandle:{height:4,width:38,borderRadius:2,backgroundColor:'#C7C9C1',alignSelf:'center',marginTop:10},detailActions:{height:62,flexDirection:'row',justifyContent:'space-between',alignItems:'center'},detailActionRight:{flexDirection:'row',gap:8},iconButton:{height:44,width:44,borderRadius:22,alignItems:'center',justifyContent:'center',backgroundColor:'#EFF0EB'},iconButtonPressed:{opacity:.66,transform:[{scale:.95}]},privacyIconButton:{backgroundColor:'#F0E5D2',borderWidth:1,borderColor:'#E2CBA8'},detailPrivacyNotice:{minHeight:38,marginBottom:16,paddingHorizontal:11,borderRadius:11,backgroundColor:'#F1E9DE',flexDirection:'row',alignItems:'center',gap:7},detailPrivacyNoticeText:{fontSize:11,fontWeight:'600',color:'#6C5B4B',flex:1},photoSectionLabel:{fontSize:12,fontWeight:'700',letterSpacing:.7,color:'#8A6B48',marginBottom:9},backPhotoBlock:{marginTop:20},backCardImage:{width:'100%',height:180,borderRadius:16,backgroundColor:'#E8E8E2'},detailName:{fontSize:25,fontWeight:'700',color:'#182B25',marginTop:20},detailIssuer:{fontSize:14,color:'#7E827A',marginTop:4},detailInfo:{marginTop:23,borderTopWidth:1,borderTopColor:'#E5E5DE'},infoLine:{minHeight:55,borderBottomWidth:1,borderBottomColor:'#E5E5DE',flexDirection:'row',alignItems:'center',justifyContent:'space-between',gap:14},infoLineTop:{paddingVertical:14,alignItems:'flex-start'},infoLabel:{flexDirection:'row',alignItems:'center',gap:8,minWidth:95},infoLabelText:{fontSize:13,color:'#72766E'},infoValue:{fontSize:14,color:'#182B25',fontWeight:'500',flex:1,textAlign:'right'},infoValueMulti:{lineHeight:20,fontWeight:'400'},deleteButton:{marginTop:22,height:48,borderRadius:13,borderWidth:1,borderColor:'#E8C6C7',alignItems:'center',justifyContent:'center',flexDirection:'row',gap:8},deleteText:{fontSize:14,fontWeight:'600',color:'#B54A52'},editorSafe:{flex:1,backgroundColor:'#F7F7F2'},editorHead:{height:58,paddingHorizontal:17,flexDirection:'row',alignItems:'center',justifyContent:'space-between',backgroundColor:'#FCFCF8',borderBottomWidth:1,borderBottomColor:'#E8E7E0'},editorTitle:{fontSize:16,fontWeight:'700',color:'#182B25'},editorCancel:{minWidth:45,paddingVertical:10},editorCancelText:{color:'#6D716A',fontSize:15},editorSave:{backgroundColor:'#182B25',borderRadius:9,paddingHorizontal:13,paddingVertical:7},editorSaveText:{color:'#fff',fontSize:14,fontWeight:'700'},editorContent:{padding:20,paddingBottom:45},photoHelper:{fontSize:12,color:'#7E817A',lineHeight:18,marginTop:-1,marginBottom:13},photoPicker:{position:'relative',marginBottom:14},photoHint:{position:'absolute',bottom:10,alignSelf:'center',backgroundColor:'rgba(255,253,247,.9)',borderRadius:18,paddingHorizontal:12,paddingVertical:7,flexDirection:'row',alignItems:'center',gap:5},photoHintText:{fontSize:12,fontWeight:'600',color:'#5C574D'},backPhotoPicker:{height:150,borderRadius:16,overflow:'hidden',backgroundColor:'#EBEAE3',marginBottom:26,position:'relative'},backPhotoPlaceholder:{flex:1,alignItems:'center',justifyContent:'center',gap:5,borderWidth:1,borderStyle:'dashed',borderColor:'#CFC3B0',borderRadius:16},backPhotoTitle:{fontSize:14,fontWeight:'700',color:'#5A5144'},backPhotoHint:{fontSize:12,color:'#82786A'},backPhotoBadge:{position:'absolute',bottom:10,alignSelf:'center',backgroundColor:'rgba(255,253,247,.92)',borderRadius:18,paddingHorizontal:12,paddingVertical:7,flexDirection:'row',alignItems:'center',gap:5},backPhotoBadgeText:{fontSize:12,fontWeight:'600',color:'#5C574D'},formSection:{fontSize:13,fontWeight:'700',letterSpacing:.6,color:'#8A6B48',marginBottom:5},field:{marginTop:16},fieldLabel:{fontSize:13,color:'#555A53',fontWeight:'600',marginBottom:8},input:{minHeight:48,borderWidth:1,borderColor:'#DEDCD4',backgroundColor:'#FCFCF8',borderRadius:12,paddingHorizontal:13,fontSize:15,color:'#182B25'},inputMulti:{height:92,paddingTop:12},categoryList:{gap:8,paddingBottom:3},categoryChoice:{height:39,borderRadius:11,borderWidth:1,borderColor:'#DFDED6',paddingHorizontal:11,flexDirection:'row',alignItems:'center',gap:6,backgroundColor:'#FCFCF8'},categoryChoiceText:{fontSize:13,fontWeight:'600',color:'#4F554E'},colorList:{flexDirection:'row',gap:13,marginBottom:4},colorDot:{width:30,height:30,borderRadius:15,alignItems:'center',justifyContent:'center'},colorDotActive:{borderWidth:2,borderColor:'#F7F7F2',shadowColor:'#333',shadowOpacity:.3,shadowRadius:3,elevation:3},favoriteToggle:{marginTop:23,padding:14,borderRadius:14,backgroundColor:'#ECEDE7',flexDirection:'row',gap:12,alignItems:'center'},switchTrack:{width:40,height:24,borderRadius:12,backgroundColor:'#B5B8B0',padding:3,justifyContent:'center'},switchTrackOn:{backgroundColor:'#8A6241'},switchThumb:{width:18,height:18,borderRadius:9,backgroundColor:'#fff'},switchThumbOn:{alignSelf:'flex-end'},favoriteLabel:{fontSize:14,fontWeight:'700',color:'#182B25'},favoriteHelp:{fontSize:12,color:'#7C8078',marginTop:2},privacyBox:{marginTop:16,flexDirection:'row',gap:9,padding:12,backgroundColor:'#F1E9DE',borderRadius:12},privacyText:{fontSize:12,color:'#716658',lineHeight:18,flex:1},settingsContent:{padding:22,paddingBottom:98},settingsGroup:{marginTop:28},settingsLabel:{fontSize:12,fontWeight:'700',letterSpacing:.6,color:'#8A6B48',marginBottom:9},settingRow:{minHeight:72,backgroundColor:'#FEFEFA',borderBottomWidth:1,borderBottomColor:'#E7E6E0',padding:13,flexDirection:'row',alignItems:'center',gap:12},settingIcon:{width:38,height:38,borderRadius:12,backgroundColor:'#E8ECE5',alignItems:'center',justifyContent:'center'},settingBody:{flex:1},settingName:{fontSize:15,fontWeight:'650',color:'#182B25'},settingHint:{fontSize:12,color:'#7E817A',marginTop:3},updateIcon:{backgroundColor:'#F1E3D0'},updateHelp:{fontSize:12,color:'#83867E',lineHeight:18,paddingHorizontal:13,paddingTop:9,backgroundColor:'#FEFEFA'},resetButton:{alignSelf:'center',marginTop:38,paddingVertical:9,paddingHorizontal:12},resetText:{fontSize:13,color:'#A24E54'}
 });
